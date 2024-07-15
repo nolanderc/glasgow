@@ -1,4 +1,7 @@
-use std::collections::BTreeMap;
+use std::{
+    cell::{Cell, OnceCell},
+    collections::BTreeMap,
+};
 
 use anyhow::{Context, Result};
 
@@ -25,8 +28,12 @@ impl Workspace {
         document.content = new.text;
         document.version = Some(new.version);
         document.language = DocumentLanguage::from_str(&new.language_id);
-        document.on_update();
+        document.reset();
         document
+    }
+
+    pub(crate) fn remove_document(&mut self, text_document: lsp::TextDocumentIdentifier) {
+        self.documents.remove(&text_document.uri);
     }
 }
 
@@ -36,22 +43,27 @@ pub struct Document {
     version: Option<DocumentVersion>,
     language: Option<DocumentLanguage>,
 
-    parser: crate::parse::Parser<'static>,
-    parser_output: Option<crate::parse::Output>,
+    parser: Cell<crate::parse::Parser<'static>>,
+    parser_output: OnceCell<crate::parse::Output>,
 }
 
 impl Document {
+    #[cfg(test)]
     pub fn new(content: String) -> Document {
         Document { content, ..Default::default() }
     }
 
     /// Called when the document contents change.
     /// This clears any cached values.
-    pub fn on_update(&mut self) {
+    pub fn reset(&mut self) {
         if let Some(output) = self.parser_output.take() {
             // reuse storage from previous tree
-            self.parser = std::mem::take(&mut self.parser).reset(output);
+            self.parser.set(self.parser.take().reset(output));
         }
+    }
+
+    pub(crate) fn content(&self) -> &str {
+        &self.content
     }
 
     pub fn offset_utf8_from_position_utf16(&self, position: lsp::Position) -> Option<OffsetUtf8> {
@@ -110,13 +122,47 @@ impl Document {
         }
     }
 
-    pub fn parse(&mut self) -> &crate::parse::Output {
-        self.parser_output.get_or_insert_with(|| {
-            let mut parser = std::mem::take(&mut self.parser);
+    pub fn position_utf16_from_offset_utf8(&self, offset: usize) -> Option<lsp::Position> {
+        let before = self.content.get(..offset)?;
+        let line_count = before.bytes().filter(|x| *x == b'\n').count();
+        let line_start = before.rfind('\n').map(|x| x + 1).unwrap_or(0);
+        let line = &before[line_start..];
+        let character_offset = line.chars().map(|x| x.len_utf16()).sum::<usize>();
+        Some(lsp::Position { line: line_count as u32, character: character_offset as u32 })
+    }
+
+    pub fn parse(&self) -> &crate::parse::Output {
+        self.parser_output.get_or_init(|| {
+            let mut parser = self.parser.take();
             let output = std::mem::take(crate::parse::parse_file(&mut parser, &self.content));
-            self.parser = parser.reset(crate::parse::Output::default());
+            self.parser.set(parser.reset(crate::parse::Output::default()));
             output
         })
+    }
+
+    pub(crate) fn apply_change(
+        &mut self,
+        change: lsp::TextDocumentContentChangeEvent,
+    ) -> Result<()> {
+        match change.range {
+            None => {
+                self.content = change.text;
+                Ok(())
+            },
+
+            Some(range) => {
+                let start =
+                    self.offset_utf8_from_position_utf16(range.start).context("invalid range")?;
+                let end =
+                    self.offset_utf8_from_position_utf16(range.end).context("invalid range")?;
+                self.content.replace_range(start..end, &change.text);
+                Ok(())
+            },
+        }
+    }
+
+    pub(crate) fn set_version(&mut self, version: i32) {
+        self.version = Some(version);
     }
 }
 

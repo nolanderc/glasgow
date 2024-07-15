@@ -45,9 +45,93 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+fn add_routes(router: &mut Router) {
+    router.handle_notice::<lsp::notification::DidOpenTextDocument>(|state, notice| {
+        state.workspace.create_document(notice.text_document);
+        Ok(())
+    });
+
+    router.handle_notice::<lsp::notification::DidCloseTextDocument>(|state, notice| {
+        state.workspace.remove_document(notice.text_document);
+        Ok(())
+    });
+
+    router.handle_notice::<lsp::notification::DidChangeTextDocument>(|state, notice| {
+        let document = state.workspace.document_mut(&notice.text_document.uri)?;
+        for change in notice.content_changes {
+            document.apply_change(change).context("could not apply change to text document")?;
+        }
+        document.set_version(notice.text_document.version);
+        Ok(())
+    });
+
+    router.handle_request::<lsp::request::HoverRequest>(|state, request| {
+        let location = &request.text_document_position_params;
+        let document = state.workspace.document_mut(&location.text_document.uri)?;
+        let offset = document
+            .offset_utf8_from_position_utf16(location.position)
+            .context("invalid position")?;
+        let parsed = document.parse();
+        Ok(None)
+    });
+
+    router.handle_request::<lsp::request::DocumentDiagnosticRequest>(|state, request| {
+        let mut diagnostics = Vec::new();
+
+        let document = state.workspace.document_mut(&request.text_document.uri)?;
+        let parsed = document.parse();
+        for error in parsed.errors.clone().iter() {
+            let message = match error.expected {
+                parse::Expected::Token(token) => format!("expected {token:?})"),
+                parse::Expected::Declaration => "expected a declaration".to_string(),
+                parse::Expected::Expression => "expected an expression".to_string(),
+                parse::Expected::Statement => "expected a statement".to_string(),
+            };
+
+            let byte_range = error.token.byte_range(document.content());
+
+            diagnostics.push(lsp::Diagnostic {
+                range: lsp::Range {
+                    start: document.position_utf16_from_offset_utf8(byte_range.start).unwrap(),
+                    end: document.position_utf16_from_offset_utf8(byte_range.end).unwrap(),
+                },
+                severity: Some(lsp::DiagnosticSeverity::ERROR),
+                code: None,
+                code_description: None,
+                source: Some("syntax".into()),
+                message,
+                related_information: None,
+                tags: None,
+                data: None,
+            });
+        }
+
+        Ok(lsp::DocumentDiagnosticReportResult::Report(lsp::DocumentDiagnosticReport::Full(
+            lsp::RelatedFullDocumentDiagnosticReport {
+                related_documents: None,
+                full_document_diagnostic_report: lsp::FullDocumentDiagnosticReport {
+                    result_id: None,
+                    items: diagnostics,
+                },
+            },
+        )))
+    });
+}
+
 fn run_server(_arguments: Arguments, connection: lsp_server::Connection) -> Result<()> {
     let server_capabilities = lsp::ServerCapabilities {
         hover_provider: Some(lsp::HoverProviderCapability::Simple(true)),
+        text_document_sync: Some(lsp::TextDocumentSyncCapability::Kind(
+            lsp::TextDocumentSyncKind::FULL,
+        )),
+        diagnostic_provider: Some(lsp::DiagnosticServerCapabilities::Options(
+            lsp::DiagnosticOptions {
+                identifier: Some(env!("CARGO_BIN_NAME").into()),
+                inter_file_dependencies: true,
+                workspace_diagnostics: false,
+                work_done_progress_options: Default::default(),
+            },
+        )),
         ..Default::default()
     };
 
@@ -55,19 +139,7 @@ fn run_server(_arguments: Arguments, connection: lsp_server::Connection) -> Resu
         serde_json::from_value(connection.initialize(serde_json::to_value(server_capabilities)?)?)?;
 
     let mut router = Router::default();
-
-    router.handle_request::<lsp::request::HoverRequest>(|state, request| {
-        let location = &request.text_document_position_params;
-        let document = state.workspace.document_mut(&location.text_document.uri)?;
-        document.offset_utf8_from_position_utf16(location.position);
-        let parsed = document.parse();
-        Ok(None)
-    });
-
-    router.handle_notice::<lsp::notification::DidOpenTextDocument>(|state, notice| {
-        state.workspace.create_document(notice.text_document);
-        Ok(())
-    });
+    add_routes(&mut router);
 
     let mut state = State::default();
 
@@ -140,42 +212,40 @@ impl Router {
             Result: serde::Serialize,
         >,
     {
-        self.handlers.insert(
+        self.add_handler(
             R::METHOD,
-            RouteHandler {
-                callback: Box::new(move |state, params| {
-                    let params = match serde_json::from_value(params) {
-                        Ok(params) => params,
-                        Err(error) => {
-                            return Err(lsp_server::ResponseError {
-                                code: lsp_server::ErrorCode::InvalidParams as _,
-                                message: format!("{error:#}"),
-                                data: None,
-                            })
-                        },
-                    };
-
-                    let value = match callback(state, params) {
-                        Ok(value) => value,
-                        Err(error) => {
-                            return Err(lsp_server::ResponseError {
-                                code: lsp_server::ErrorCode::RequestFailed as _,
-                                message: format!("{error:#}"),
-                                data: None,
-                            })
-                        },
-                    };
-
-                    match serde_json::to_value(value) {
-                        Ok(value) => Ok(value),
-                        Err(error) => Err(lsp_server::ResponseError {
-                            code: lsp_server::ErrorCode::InternalError as _,
+            Box::new(move |state, params| {
+                let params = match serde_json::from_value(params) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        return Err(lsp_server::ResponseError {
+                            code: lsp_server::ErrorCode::InvalidParams as _,
                             message: format!("{error:#}"),
                             data: None,
-                        }),
-                    }
-                }),
-            },
+                        })
+                    },
+                };
+
+                let value = match callback(state, params) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return Err(lsp_server::ResponseError {
+                            code: lsp_server::ErrorCode::RequestFailed as _,
+                            message: format!("{error:#}"),
+                            data: None,
+                        })
+                    },
+                };
+
+                match serde_json::to_value(value) {
+                    Ok(value) => Ok(value),
+                    Err(error) => Err(lsp_server::ResponseError {
+                        code: lsp_server::ErrorCode::InternalError as _,
+                        message: format!("{error:#}"),
+                        data: None,
+                    }),
+                }
+            }),
         );
     }
 
@@ -185,33 +255,37 @@ impl Router {
     ) where
         N: lsp::notification::Notification<Params: for<'de> serde::Deserialize<'de>>,
     {
-        self.handlers.insert(
+        self.add_handler(
             N::METHOD,
-            RouteHandler {
-                callback: Box::new(move |state, params| {
-                    let params = match serde_json::from_value(params) {
-                        Ok(params) => params,
-                        Err(error) => {
-                            return Err(lsp_server::ResponseError {
-                                code: lsp_server::ErrorCode::InvalidParams as _,
-                                message: format!("{error:#}"),
-                                data: None,
-                            })
-                        },
-                    };
-
-                    if let Err(error) = callback(state, params) {
+            Box::new(move |state, params| {
+                let params = match serde_json::from_value(params) {
+                    Ok(params) => params,
+                    Err(error) => {
                         return Err(lsp_server::ResponseError {
-                            code: lsp_server::ErrorCode::RequestFailed as _,
+                            code: lsp_server::ErrorCode::InvalidParams as _,
                             message: format!("{error:#}"),
                             data: None,
-                        });
-                    }
+                        })
+                    },
+                };
 
-                    Ok(serde_json::Value::Null)
-                }),
-            },
+                if let Err(error) = callback(state, params) {
+                    return Err(lsp_server::ResponseError {
+                        code: lsp_server::ErrorCode::RequestFailed as _,
+                        message: format!("{error:#}"),
+                        data: None,
+                    });
+                }
+
+                Ok(serde_json::Value::Null)
+            }),
         );
+    }
+
+    fn add_handler(&mut self, method: &'static str, callback: RouteCallback) {
+        if let Some(_previous) = self.handlers.insert(method, RouteHandler { callback }) {
+            panic!("multiple handlers registered for method {method:?}");
+        }
     }
 
     fn dispatch(&self, state: &mut State, method: &str, params: serde_json::Value) -> RouteResult {

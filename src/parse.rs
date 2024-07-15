@@ -301,13 +301,13 @@ pub struct Tree {
     pub extra: Vec<Node>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct Error {
     pub token: Node,
     pub expected: Expected,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum Expected {
     Token(Tag),
     Declaration,
