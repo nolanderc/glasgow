@@ -15,6 +15,11 @@ function test {
     cargo test "$@"
 }
 
+function test-snapshot {
+    export UPDATE_EXPECT=1
+    cargo test "$@"
+}
+
 function run {
     cargo run "$@"
 }

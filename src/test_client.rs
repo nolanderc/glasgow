@@ -1,6 +1,6 @@
 #![cfg(test)]
 
-use color_eyre::Result;
+use anyhow::{anyhow, Context as _, Result};
 
 pub struct Client {
     connection: lsp_server::Connection,
@@ -31,7 +31,7 @@ impl Client {
         id.0.into()
     }
 
-    pub fn request<R>(&self, params: R::Params) -> R::Result
+    pub fn request_fallible<R>(&self, params: R::Params) -> Result<R::Result>
     where
         R: lsp::request::Request<
             Params: serde::Serialize,
@@ -45,51 +45,81 @@ impl Client {
             .send(lsp_server::Message::Request(lsp_server::Request {
                 id: id.clone(),
                 method: R::METHOD.into(),
-                params: serde_json::to_value(params).unwrap(),
+                params: serde_json::to_value(params)?,
             }))
-            .unwrap();
+            .context("could not send message to server")?;
 
-        let message = self.connection.receiver.recv().unwrap();
+        let message =
+            self.connection.receiver.recv().context("could not receive message from server")?;
+
         let response = match message {
             lsp_server::Message::Response(response) => response,
             lsp_server::Message::Request(request) => {
-                panic!("got unexpected request: {request:?}")
+                return Err(anyhow!("got unexpected request: {request:?}"));
             },
             lsp_server::Message::Notification(notification) => {
-                panic!("got unexpected notification: {notification:?}")
+                return Err(anyhow!("got unexpected notification: {notification:?}"));
             },
         };
 
         assert_eq!(response.id, id);
         if let Some(error) = response.error {
-            panic!("server responded with error: {:#?}", error);
+            return Err(anyhow!("server responded with error: {:#?}", error));
         }
 
         let value = response.result.expect("response did not contain a value");
-        serde_json::from_value(value).unwrap()
+        Ok(serde_json::from_value(value)?)
+    }
+
+    pub fn request<R>(&self, params: R::Params) -> R::Result
+    where
+        R: lsp::request::Request<
+            Params: serde::Serialize,
+            Result: for<'de> serde::Deserialize<'de>,
+        >,
+    {
+        self.request_fallible::<R>(params).expect("request failed")
+    }
+
+    pub fn notify_fallible<N>(&self, params: N::Params) -> Result<()>
+    where
+        N: lsp::notification::Notification<Params: serde::Serialize>,
+    {
+        self.connection.sender.send(lsp_server::Message::Notification(
+            lsp_server::Notification {
+                method: N::METHOD.into(),
+                params: serde_json::to_value(params)?,
+            },
+        ))?;
+        Ok(())
     }
 
     pub fn notify<N>(&self, params: N::Params)
     where
         N: lsp::notification::Notification<Params: serde::Serialize>,
     {
-        self.connection
-            .sender
-            .send(lsp_server::Message::Notification(lsp_server::Notification {
-                method: N::METHOD.into(),
-                params: serde_json::to_value(params).unwrap(),
-            }))
-            .unwrap();
+        self.notify_fallible::<N>(params).expect("could not send notification")
     }
-}
 
-impl Drop for Client {
-    fn drop(&mut self) {
+    pub fn open_document(&self, content: &str) -> lsp::Uri {
+        let uri: lsp::Uri = format!("file_{}.wgsl", self.generate_requeust_id()).parse().unwrap();
+        self.notify::<lsp::notification::DidOpenTextDocument>(lsp::DidOpenTextDocumentParams {
+            text_document: lsp::TextDocumentItem {
+                uri: uri.clone(),
+                language_id: "wgsl".into(),
+                version: i32::MIN,
+                text: content.into(),
+            },
+        });
+        uri
+    }
+
+    pub fn close(&mut self) -> Result<()> {
         let done = std::sync::Mutex::new(false);
         let condition = std::sync::Condvar::new();
 
-        self.request::<lsp::request::Shutdown>(());
-        self.notify::<lsp::notification::Exit>(());
+        self.request_fallible::<lsp::request::Shutdown>(())?;
+        self.notify_fallible::<lsp::notification::Exit>(())?;
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
 
@@ -116,6 +146,21 @@ impl Drop for Client {
 
             *done.lock().unwrap() = true;
             condition.notify_all();
-        })
+        });
+
+        Ok(())
+    }
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        let result = self.close();
+        if std::thread::panicking() {
+            if let Err(error) = result {
+                eprintln!("\nERROR: could not properly close client connection: {error:?}");
+            }
+        } else {
+            result.expect("could not properly close client connection");
+        }
     }
 }
