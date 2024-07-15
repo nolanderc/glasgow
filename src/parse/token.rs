@@ -37,11 +37,16 @@ impl<'src> Tokenizer<'src> {
         }
     }
 
+    pub fn source(&self) -> &'src str {
+        self.source
+    }
+
     pub fn skip_whitespace(&mut self) {
         self.offset += whitespace(&self.source[self.offset..]);
     }
 
     pub fn next(&mut self) -> Node {
+        self.offset += whitespace(&self.source[self.offset..]);
         let (token, length) = self.strip_token();
         let node =
             Node { tag: token, length: Length::new_token(length), offset: self.offset as u32 };

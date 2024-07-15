@@ -249,20 +249,29 @@ impl Node {
     }
 
     pub fn byte_range(self, source: &str) -> std::ops::Range<usize> {
-        debug_assert!(self.tag.is_syntax());
+        debug_assert!(self.tag.is_token());
 
+        let offset = self.offset as usize;
         let length = self
             .length
             .get_token()
-            .or_else(|| token::variable_length(source))
+            .or_else(|| token::variable_length(&source[offset..]))
+            .map(|x| x.get())
+            .or_else(|| if self.tag == Tag::Eof { Some(0) } else { None })
             .expect("could not get length of token");
 
-        self.offset as usize..self.offset as usize + length.get()
+        offset..offset + length
+    }
+
+    pub fn slice(self, source: &str) -> &str {
+        let range = self.byte_range(source);
+        &source[range]
     }
 
     pub fn children(self) -> std::ops::Range<usize> {
         debug_assert!(self.tag.is_syntax());
-        self.offset as usize..self.length.get_syntax() as usize
+        let offset = self.offset as usize;
+        offset..offset + self.length.get_syntax() as usize
     }
 }
 
@@ -272,7 +281,6 @@ pub struct Length(U24);
 
 impl Length {
     fn new_token(length: usize) -> Length {
-        assert_ne!(length, 0);
         Length(U24::from_usize(length).unwrap_or(U24::ZERO))
     }
 
@@ -297,8 +305,44 @@ pub struct Output {
 
 #[derive(Default)]
 pub struct Tree {
-    pub nodes: Vec<Node>,
-    pub extra: Vec<Node>,
+    nodes: Vec<Node>,
+    extra: Vec<Node>,
+}
+
+pub type NodeIndex = u32;
+pub type Depth = usize;
+
+impl Tree {
+    pub fn node(&self, index: NodeIndex) -> Node {
+        self.nodes[index as usize]
+    }
+
+    #[cfg(test)]
+    pub fn traverse_pre_order<E>(
+        &self,
+        mut visit: impl FnMut(NodeIndex, Node, Depth) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let mut stack = Vec::with_capacity(32);
+
+        stack.push(self.nodes.len() - 1..self.nodes.len());
+
+        while let Some(top) = stack.last_mut() {
+            let Some(curr) = top.next() else {
+                stack.pop();
+                continue;
+            };
+
+            let depth = stack.len() - 1;
+            let node = self.nodes[curr];
+            visit(curr as NodeIndex, node, depth)?;
+
+            if node.tag.is_syntax() {
+                stack.push(node.children());
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -358,8 +402,6 @@ impl<'src> Parser<'src> {
         self.output.tree.nodes.reserve(source.len() / 8);
         self.output.errors.clear();
 
-        self.fuel = Self::MAX_FUEL;
-
         self.advance_no_emit();
     }
 
@@ -394,6 +436,7 @@ impl<'src> Parser<'src> {
     }
 
     fn advance_no_emit(&mut self) {
+        self.fuel = Self::MAX_FUEL;
         self.current_token = loop {
             let token = self.tokens.next();
             match token.tag {
@@ -1073,4 +1116,66 @@ fn directive_requires(parser: &mut Parser) {
     }
     parser.expect(Tag::SemiColon);
     parser.close(m, Tag::DirectiveRequires);
+}
+
+#[cfg(test)]
+mod tests {
+    use expect_test::expect;
+
+    use super::*;
+
+    fn check(source: &str, expected: expect_test::Expect) {
+        use std::fmt::Write;
+
+        let mut parser = Parser::new();
+        let output = parse_file(&mut parser, source);
+
+        let mut text = String::new();
+
+        if !output.errors.is_empty() {
+            writeln!(text, "===== ERRORS =====").unwrap();
+            for error in output.errors.iter() {
+                writeln!(text, "{error:?}").unwrap();
+            }
+        }
+
+        writeln!(text, "===== SYNTAX =====").unwrap();
+        output
+            .tree
+            .traverse_pre_order(|_, node, depth| {
+                for _ in 0..depth {
+                    text.push_str("  ");
+                }
+                if node.tag.is_syntax() {
+                    writeln!(text, "{:?}", node.tag)
+                } else {
+                    writeln!(text, "{:?} {:?}", node.tag, node.slice(source))
+                }
+            })
+            .unwrap();
+
+        expected.assert_eq(&text);
+    }
+
+    #[test]
+    fn decl_fn() {
+        check(
+            indoc::indoc! {r#"
+                fn main() {}
+            "#},
+            expect![[r#"
+                ===== SYNTAX =====
+                Root
+                  DeclFn
+                    KeywordFn "fn"
+                    Identifier "main"
+                    DeclFnParameterList
+                      LParen "("
+                      RParen ")"
+                    StmtBlock
+                      LCurly "{"
+                      RCurly "}"
+            "#]],
+        );
+    }
 }

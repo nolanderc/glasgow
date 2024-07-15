@@ -10,6 +10,8 @@ pub struct Client {
 
 impl Client {
     pub fn new() -> Client {
+        tracing_subscriber::fmt().init();
+
         let (client, server) = lsp_server::Connection::memory();
         let arguments = <crate::Arguments as clap::Parser>::parse_from([env!("CARGO_BIN_NAME")]);
         let server = std::thread::spawn(move || crate::run_server(arguments, server));

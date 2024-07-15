@@ -12,6 +12,7 @@ function build {
 }
 
 function test {
+    export RUST_BACKTRACE=1
     cargo test "$@"
 }
 
