@@ -1,6 +1,6 @@
-use std::num::NonZeroUsize;
+use crate::util::U24;
 
-use super::{Length, Node, Tag};
+use super::{Node, Tag};
 
 pub struct Tokenizer<'src> {
     source: &'src str,
@@ -48,8 +48,11 @@ impl<'src> Tokenizer<'src> {
     pub fn next(&mut self) -> Node {
         self.offset += whitespace(&self.source[self.offset..]);
         let (token, length) = self.strip_token();
-        let node =
-            Node { tag: token, length: Length::new_token(length), offset: self.offset as u32 };
+        let node = Node {
+            tag: token,
+            length: U24::from_usize(length).expect("token exceeds maximum length"),
+            offset: self.offset as u32,
+        };
         self.offset += length;
         node
     }
@@ -446,18 +449,6 @@ fn utf8_codepoint_length(first_byte: u8) -> u8 {
     }
 }
 
-pub fn variable_length(source: &str) -> Option<NonZeroUsize> {
-    if let Some(len) = NonZeroUsize::new(identifier(source)) {
-        return Some(len);
-    }
-
-    if let Some(len) = NonZeroUsize::new(number(source).1) {
-        return Some(len);
-    }
-
-    None
-}
-
 fn identifier(source: &str) -> usize {
     let mut chars = source.chars();
     let Some(first) = chars.next() else { return 0 };
@@ -506,15 +497,6 @@ fn classify_identifier(identifier: &str) -> Tag {
         "while" => Tag::KeywordWhile,
 
         _ => Tag::Identifier,
-    }
-}
-
-fn number(source: &str) -> (Tag, usize) {
-    let bytes = source.as_bytes();
-    match bytes.first() {
-        Some(b'0') => number_prefix_0(source),
-        Some(b'1'..=b'9') => number_prefix_1_9(source),
-        _ => (Tag::InvalidToken, 0),
     }
 }
 
@@ -653,10 +635,15 @@ impl TokenSet {
     }
 
     pub const fn new(tokens: &[Tag]) -> TokenSet {
-        Self::empty().with(tokens)
+        Self::empty().with_many(tokens)
     }
 
-    pub const fn with(mut self, mut tokens: &[Tag]) -> TokenSet {
+    pub const fn with(mut self, token: Tag) -> TokenSet {
+        self.bits |= Self::mask(token);
+        self
+    }
+
+    pub const fn with_many(mut self, mut tokens: &[Tag]) -> TokenSet {
         while let Some((token, rest)) = tokens.split_first() {
             tokens = rest;
             self.bits |= Self::mask(*token);

@@ -1,7 +1,5 @@
 mod token;
 
-use std::num::NonZeroUsize;
-
 use crate::util::U24;
 
 use self::token::TokenSet;
@@ -177,34 +175,23 @@ pub enum Tag {
     DirectiveRequires,
     DirectiveRequiresName,
 
-    ArgumentList,
-    Argument,
-    Attribute,
-
-    ExprParens,
-    ExprPrefix,
-
-    ExprCall,
-    AttributeList,
-    TemplateList,
-    TemplateParameter,
-    IdentifierWithTemplate,
-    ExprInfix,
-    ExprMember,
-    ExprIndex,
-    DeclAlias,
     ConstAssert,
+
+    DeclAlias,
 
     DeclStruct,
     DeclStructFieldList,
     DeclStructField,
+
     DeclConst,
     DeclVar,
+    DeclOverride,
 
     DeclFn,
     DeclFnParameterList,
     DeclFnParameter,
     DeclFnOutput,
+
     StmtBlock,
     StmtReturn,
     StmtDiscard,
@@ -222,6 +209,22 @@ pub enum Tag {
     StmtSwitch,
     StmtSwitchBranch,
     StmtSwitchCaseSelector,
+
+    ArgumentList,
+    Argument,
+    Attribute,
+
+    ExprParens,
+    ExprPrefix,
+
+    ExprCall,
+    AttributeList,
+    TemplateList,
+    TemplateParameter,
+    IdentifierWithTemplate,
+    ExprInfix,
+    ExprMember,
+    ExprIndex,
     // ^^^^^ syntax ^^^^^ //
 }
 
@@ -233,13 +236,101 @@ impl Tag {
     pub const fn is_syntax(self) -> bool {
         !self.is_token()
     }
+
+    pub const fn token_description(self) -> Option<&'static str> {
+        Some(match self {
+            Tag::Eof => "the end of file",
+            Tag::InvalidToken => "an invalid token",
+            Tag::Comment => "a comment",
+            Tag::Identifier => "an identifier",
+            Tag::IntegerDecimal => "an integer literal",
+            Tag::IntegerHex => "an integer literal",
+            Tag::FloatDecimal => "a floating point literal",
+            Tag::FloatHex => "a floating point literal",
+            Tag::KeywordAlias => "`alias`",
+            Tag::KeywordBreak => "`break`",
+            Tag::KeywordCase => "`case`",
+            Tag::KeywordConst => "`const`",
+            Tag::KeywordConstAssert => "`const_assert`",
+            Tag::KeywordContinue => "`continue`",
+            Tag::KeywordContinuing => "`continuing`",
+            Tag::KeywordDefault => "`default`",
+            Tag::KeywordDiagnostic => "`diagnostic`",
+            Tag::KeywordDiscard => "`discard`",
+            Tag::KeywordElse => "`else`",
+            Tag::KeywordEnable => "`enable`",
+            Tag::KeywordFalse => "`false`",
+            Tag::KeywordFn => "`fn`",
+            Tag::KeywordFor => "`for`",
+            Tag::KeywordIf => "`if`",
+            Tag::KeywordLet => "`let`",
+            Tag::KeywordLoop => "`loop`",
+            Tag::KeywordOverride => "`override`",
+            Tag::KeywordRequires => "`requires`",
+            Tag::KeywordReturn => "`return`",
+            Tag::KeywordStruct => "`struct`",
+            Tag::KeywordSwitch => "`switch`",
+            Tag::KeywordTrue => "`true`",
+            Tag::KeywordVar => "`var`",
+            Tag::KeywordWhile => "`while`",
+            Tag::AtSign => "`@`",
+            Tag::ThinArrowRight => "`->`",
+            Tag::LParen => "`(`",
+            Tag::RParen => "`)`",
+            Tag::LBracket => "`[`",
+            Tag::RBracket => "`]`",
+            Tag::LCurly => "`{`",
+            Tag::RCurly => "`}`",
+            Tag::Dot => "`.`",
+            Tag::Comma => "`,`",
+            Tag::Colon => "`:`",
+            Tag::SemiColon => "`;`",
+            Tag::Plus => "`+`",
+            Tag::Minus => "`-`",
+            Tag::Asterisk => "`*`",
+            Tag::Slash => "`/`",
+            Tag::Percent => "`%`",
+            Tag::Chevron => "`^`",
+            Tag::Tilde => "`~`",
+            Tag::PlusEqual => "`+=`",
+            Tag::MinusEqual => "`-=`",
+            Tag::AsteriskEqual => "`*=`",
+            Tag::SlashEqual => "`/=`",
+            Tag::PercentEqual => "`%=`",
+            Tag::ChevronEqual => "`^+`",
+            Tag::AmpersandEqual => "`&=`",
+            Tag::BarEqual => "`|=`",
+            Tag::PlusPlus => "`++`",
+            Tag::MinusMinus => "`--`",
+            Tag::Less => "`<`",
+            Tag::LessEqual => "`<=`",
+            Tag::LessLess => "`<<`",
+            Tag::LessLessEqual => "`<<=`",
+            Tag::Greater => "`>`",
+            Tag::GreaterEqual => "`>=`",
+            Tag::GreaterGreater => "`>>`",
+            Tag::GreaterGreaterEqual => "`>>=`",
+            Tag::Equal => "`=`",
+            Tag::EqualEqual => "`==`",
+            Tag::Exclamation => "`!`",
+            Tag::ExclamationEqual => "`!=`",
+            Tag::Ampersand => "`&`",
+            Tag::AmpersandAmpersand => "`i&&`",
+            Tag::Bar => "`|`",
+            Tag::BarBar => "`||`",
+            Tag::TemplateListStart => "`<`",
+            Tag::TemplateListEnd => "`>`",
+
+            _ => return None,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub struct Node {
     tag: Tag,
-    length: Length,
+    length: U24,
     offset: u32,
 }
 
@@ -248,52 +339,29 @@ impl Node {
         self.tag
     }
 
-    pub fn byte_range(self, source: &str) -> std::ops::Range<usize> {
-        debug_assert!(self.tag.is_token());
+    pub fn is_token(self) -> bool {
+        self.tag.is_token()
+    }
 
+    pub fn is_syntax(self) -> bool {
+        self.tag.is_syntax()
+    }
+
+    pub fn children(self) -> impl ExactSizeIterator<Item = NodeIndex> + DoubleEndedIterator {
+        assert!(self.is_syntax());
+        (self.offset..self.offset + self.length.to_u32()).map(NodeIndex)
+    }
+
+    fn children_range(self) -> std::ops::Range<usize> {
+        assert!(self.is_syntax());
         let offset = self.offset as usize;
-        let length = self
-            .length
-            .get_token()
-            .or_else(|| token::variable_length(&source[offset..]))
-            .map(|x| x.get())
-            .or_else(|| if self.tag == Tag::Eof { Some(0) } else { None })
-            .expect("could not get length of token");
-
-        offset..offset + length
+        offset..offset + self.length.to_usize()
     }
 
-    pub fn slice(self, source: &str) -> &str {
-        let range = self.byte_range(source);
-        &source[range]
-    }
-
-    pub fn children(self) -> std::ops::Range<usize> {
-        debug_assert!(self.tag.is_syntax());
+    pub fn byte_range(self) -> std::ops::Range<usize> {
+        assert!(self.is_token());
         let offset = self.offset as usize;
-        offset..offset + self.length.get_syntax() as usize
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(transparent)]
-pub struct Length(U24);
-
-impl Length {
-    fn new_token(length: usize) -> Length {
-        Length(U24::from_usize(length).unwrap_or(U24::ZERO))
-    }
-
-    pub fn get_token(self) -> Option<NonZeroUsize> {
-        NonZeroUsize::new(self.0.to_usize())
-    }
-
-    fn new_syntax(length: usize) -> Option<Length> {
-        Some(Length(U24::from_usize(length)?))
-    }
-
-    pub fn get_syntax(self) -> u32 {
-        self.0.to_u32()
+        offset..offset + self.length.to_usize()
     }
 }
 
@@ -309,22 +377,35 @@ pub struct Tree {
     extra: Vec<Node>,
 }
 
-pub type NodeIndex = u32;
-pub type Depth = usize;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct NodeIndex(u32);
 
 impl Tree {
     pub fn node(&self, index: NodeIndex) -> Node {
-        self.nodes[index as usize]
+        self.nodes[index.0 as usize]
+    }
+
+    pub fn children(&self, node: Node) -> &[Node] {
+        &self.nodes[node.children_range()]
+    }
+
+    pub fn root_index(&self) -> NodeIndex {
+        NodeIndex((self.nodes.len() - 1) as u32)
+    }
+
+    pub fn root(&self) -> Node {
+        self.node(self.root_index())
     }
 
     #[cfg(test)]
     pub fn traverse_pre_order<E>(
         &self,
-        mut visit: impl FnMut(NodeIndex, Node, Depth) -> Result<(), E>,
+        mut visit: impl FnMut(NodeIndex, Node, usize) -> Result<(), E>,
     ) -> Result<(), E> {
         let mut stack = Vec::with_capacity(32);
 
-        stack.push(self.nodes.len() - 1..self.nodes.len());
+        let root = self.root_index().0;
+        stack.push(root..root + 1);
 
         while let Some(top) = stack.last_mut() {
             let Some(curr) = top.next() else {
@@ -333,15 +414,84 @@ impl Tree {
             };
 
             let depth = stack.len() - 1;
-            let node = self.nodes[curr];
-            visit(curr as NodeIndex, node, depth)?;
+            let node = self.node(NodeIndex(curr));
+            visit(NodeIndex(curr), node, depth)?;
 
             if node.tag.is_syntax() {
-                stack.push(node.children());
+                let children = node.children_range();
+                stack.push(children.start as u32..children.end as u32);
             }
         }
 
         Ok(())
+    }
+
+    pub fn enumerate_token_path_at_offset_utf8(
+        &self,
+        offset: usize,
+        mut callback: impl FnMut(NodeIndex),
+    ) -> bool {
+        fn find_in_node(
+            nodes: &[Node],
+            curr: NodeIndex,
+            offset: usize,
+            callback: &mut impl FnMut(NodeIndex),
+        ) -> bool {
+            let node = nodes[curr.0 as usize];
+
+            if node.tag.is_token() {
+                if node.byte_range().contains(&offset) {
+                    callback(curr as NodeIndex);
+                    return true;
+                } else {
+                    return false;
+                }
+            }
+
+            let mut candidate_children = node.children_range();
+
+            for child in node.children().rev() {
+                let c = nodes[child.0 as usize];
+                if c.tag.is_token() {
+                    let range = c.byte_range();
+                    if range.end <= offset {
+                        candidate_children.start = child.0 as usize + 1;
+                        break;
+                    }
+                    if offset < range.start {
+                        candidate_children.end = child.0 as usize;
+                    }
+                }
+            }
+
+            for child in candidate_children {
+                if find_in_node(nodes, NodeIndex(child as u32), offset, callback) {
+                    callback(curr as NodeIndex);
+                    return true;
+                }
+            }
+
+            false
+        }
+
+        find_in_node(&self.nodes, self.root_index(), offset, &mut callback)
+    }
+
+    pub fn token_at_offset_utf8(&self, offset: usize) -> Option<NodeIndex> {
+        let mut first = None;
+        self.enumerate_token_path_at_offset_utf8(offset, |index| {
+            if first.is_none() {
+                first = Some(index);
+            }
+        });
+        first
+    }
+
+    pub fn token_path_at_offset_utf8(&self, offset: usize) -> Vec<NodeIndex> {
+        let mut path = Vec::new();
+        self.enumerate_token_path_at_offset_utf8(offset, |index| path.push(index));
+        path.reverse();
+        path
     }
 }
 
@@ -349,6 +499,35 @@ impl Tree {
 pub struct Error {
     pub token: Node,
     pub expected: Expected,
+}
+
+impl Error {
+    pub fn message(self, source: &str) -> String {
+        let expected = match self.expected {
+            Expected::Token(token) => match token.token_description() {
+                Some(description) => format!("expected {description}"),
+                _ => unreachable!("expected a token, but found {token:?}"),
+            },
+            Expected::Declaration => "expected a declaration".into(),
+            Expected::Expression => "expected an expression".into(),
+            Expected::Statement => "expected a statement".into(),
+        };
+
+        let found = match self.token.tag {
+            Tag::Eof => "the end of file".to_string(),
+            _ => {
+                let snippet = &source[self.token.byte_range()];
+                let print_safe = snippet.bytes().all(|x| x.is_ascii_graphic() || x == b' ');
+                if print_safe {
+                    format!("`{snippet}`")
+                } else {
+                    format!("`{}`", snippet.escape_debug().collect::<String>())
+                }
+            },
+        };
+
+        format!("{expected}, but found {found}")
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -376,12 +555,12 @@ impl<'src> Default for Parser<'src> {
 }
 
 impl<'src> Parser<'src> {
-    const MAX_FUEL: u32 = 16;
+    const MAX_FUEL: u32 = 32;
 
     pub fn new() -> Parser<'static> {
         Parser {
             tokens: token::Tokenizer::empty(),
-            current_token: Node { tag: Tag::Eof, length: Length(U24::ZERO), offset: 0 },
+            current_token: Node { tag: Tag::Eof, length: U24::ZERO, offset: 0 },
             stack: Vec::new(),
             output: Output::default(),
             fuel: 0,
@@ -426,7 +605,7 @@ impl<'src> Parser<'src> {
 
         self.stack.push(Node {
             tag,
-            length: Length::new_syntax(end - start).unwrap_or(Length(U24::ZERO)),
+            length: U24::from_usize(end - start).expect("syntax node has too many children"),
             offset: start.try_into().unwrap(),
         })
     }
@@ -451,11 +630,29 @@ impl<'src> Parser<'src> {
         self.advance_no_emit();
     }
 
-    fn advance_with_error(&mut self, expected: Expected) {
-        let m = self.open();
+    fn advance_with_error(&mut self, mark: OpenMark, expected: Expected) {
         self.emit_error(expected);
         self.advance();
-        self.close(m, Tag::InvalidSyntax);
+        self.close(mark, Tag::InvalidSyntax);
+
+        match self.stack.as_slice() {
+            [.., a, b] if a.tag == Tag::InvalidSyntax && b.tag == Tag::InvalidSyntax => {
+                if a.children_range().end == b.children_range().start {
+                    if let Some(combined_length) =
+                        U24::from_usize(a.length.to_usize() + b.length.to_usize())
+                    {
+                        let combined = Node {
+                            tag: Tag::InvalidSyntax,
+                            offset: a.offset,
+                            length: combined_length,
+                        };
+                        self.stack.truncate(self.stack.len() - 2);
+                        self.stack.push(combined);
+                    }
+                }
+            },
+            _ => {},
+        }
     }
 
     fn peek(&mut self) -> Tag {
@@ -470,10 +667,6 @@ impl<'src> Parser<'src> {
 
     fn at_any(&mut self, set: TokenSet) -> bool {
         set.contains(self.peek())
-    }
-
-    fn eof(&mut self) -> bool {
-        self.at(Tag::Eof)
     }
 
     fn consume(&mut self, token: Tag) -> bool {
@@ -496,6 +689,19 @@ impl<'src> Parser<'src> {
 struct OpenMark {
     stack_length: usize,
 }
+
+const TOP_LEVEL_FIRST: TokenSet = TokenSet::new(&[
+    Tag::KeywordDiagnostic,
+    Tag::KeywordEnable,
+    Tag::KeywordRequires,
+    Tag::KeywordConstAssert,
+    Tag::KeywordStruct,
+    Tag::KeywordConst,
+    Tag::KeywordOverride,
+    Tag::KeywordVar,
+    Tag::KeywordFn,
+    Tag::SemiColon,
+]);
 
 pub fn parse_file<'parser, 'src>(
     parser: &'parser mut Parser<'src>,
@@ -541,7 +747,7 @@ pub fn parse_file<'parser, 'src>(
                 {
                     let m = parser.open();
                     parser.expect(Tag::LCurly);
-                    while !parser.eof() && !parser.at(Tag::RCurly) {
+                    while parser.at(Tag::Identifier) || parser.at(Tag::AtSign) {
                         let m = parser.open();
                         attribute_list_maybe(parser, m);
                         parser.expect(Tag::Identifier);
@@ -561,15 +767,7 @@ pub fn parse_file<'parser, 'src>(
 
             Tag::KeywordConst => {
                 let m = parser.open();
-                parser.advance();
-                parser.expect(Tag::Identifier);
-                if parser.consume(Tag::Colon) {
-                    type_specifier(parser);
-                }
-                parser.expect(Tag::Equal);
-                expression(parser);
-                parser.expect(Tag::SemiColon);
-                parser.close(m, Tag::DeclConst);
+                variable_declaration(parser, m, Tag::KeywordConst);
             },
 
             _ => {
@@ -577,6 +775,10 @@ pub fn parse_file<'parser, 'src>(
                 attribute_list_maybe(parser, m);
 
                 match parser.peek() {
+                    tag @ (Tag::KeywordOverride | Tag::KeywordVar) => {
+                        variable_declaration(parser, m, tag)
+                    },
+
                     Tag::KeywordFn => {
                         parser.advance();
                         parser.expect(Tag::Identifier);
@@ -584,7 +786,7 @@ pub fn parse_file<'parser, 'src>(
                         {
                             let m = parser.open();
                             parser.expect(Tag::LParen);
-                            while !parser.eof() && !parser.at(Tag::RParen) {
+                            while parser.at(Tag::Identifier) || parser.at(Tag::AtSign) {
                                 let m = parser.open();
                                 attribute_list_maybe(parser, m);
                                 parser.expect(Tag::Identifier);
@@ -611,7 +813,7 @@ pub fn parse_file<'parser, 'src>(
                         parser.close(m, Tag::DeclFn);
                     },
 
-                    _ => parser.advance_with_error(Expected::Declaration),
+                    _ => parser.advance_with_error(m, Expected::Declaration),
                 }
             },
         }
@@ -621,6 +823,25 @@ pub fn parse_file<'parser, 'src>(
 
     parser.finish()
 }
+
+const STATEMENT_FIRST: TokenSet = EXPRESSION_FIRST.with_many(&[
+    Tag::KeywordReturn,
+    Tag::KeywordConstAssert,
+    Tag::KeywordDiscard,
+    Tag::KeywordBreak,
+    Tag::KeywordContinue,
+    Tag::KeywordContinuing,
+    Tag::KeywordLet,
+    Tag::KeywordVar,
+    Tag::KeywordConst,
+    Tag::KeywordFn,
+    Tag::KeywordIf,
+    Tag::KeywordLoop,
+    Tag::KeywordWhile,
+    Tag::KeywordSwitch,
+    Tag::SemiColon,
+    Tag::LCurly,
+]);
 
 fn statement(parser: &mut Parser) {
     match parser.peek() {
@@ -670,7 +891,8 @@ fn statement(parser: &mut Parser) {
         },
 
         tag @ (Tag::KeywordLet | Tag::KeywordConst | Tag::KeywordVar) => {
-            statement_variable_declaration(parser, tag)
+            let m = parser.open();
+            variable_declaration(parser, m, tag)
         },
 
         Tag::SemiColon => parser.advance(),
@@ -691,7 +913,8 @@ fn statement(parser: &mut Parser) {
                         parser.expect(Tag::LParen);
                         match parser.peek() {
                             tag @ (Tag::KeywordLet | Tag::KeywordConst | Tag::KeywordVar) => {
-                                statement_variable_declaration(parser, tag)
+                                let m = parser.open();
+                                variable_declaration(parser, m, tag)
                             },
                             _ if parser.at_any(EXPRESSION_FIRST) => statement_expression(parser),
                             _ => parser.emit_error(Expected::Statement),
@@ -745,14 +968,16 @@ fn statement(parser: &mut Parser) {
                     expression(parser);
 
                     parser.expect(Tag::LCurly);
-                    while !parser.eof() && !parser.at(Tag::RCurly) {
+                    while parser.at(Tag::KeywordCase) || parser.at(Tag::KeywordDefault) {
                         let m = parser.open();
 
                         const CASE_FOLLOWS: TokenSet =
                             TokenSet::new(&[Tag::Colon, Tag::LCurly, Tag::AtSign]);
 
                         if parser.consume(Tag::KeywordCase) {
-                            while !parser.eof() && !parser.at_any(CASE_FOLLOWS) {
+                            while parser
+                                .at_any(const { EXPRESSION_FIRST.with(Tag::KeywordDefault) })
+                            {
                                 let m = parser.open();
                                 if !parser.consume(Tag::KeywordDefault) {
                                     expression(parser);
@@ -776,16 +1001,15 @@ fn statement(parser: &mut Parser) {
                     parser.close(m, Tag::StmtSwitch);
                 },
 
-                _ => parser.advance_with_error(Expected::Statement),
+                _ => parser.advance_with_error(m, Expected::Statement),
             }
         },
     }
 }
 
-fn statement_variable_declaration(parser: &mut Parser, tag: Tag) {
-    let m = parser.open();
+fn variable_declaration(parser: &mut Parser, mark: OpenMark, tag: Tag) {
+    parser.expect(tag);
 
-    parser.advance();
     if tag == Tag::KeywordVar && parser.at(Tag::TemplateListStart) {
         template_list(parser);
     }
@@ -806,11 +1030,12 @@ fn statement_variable_declaration(parser: &mut Parser, tag: Tag) {
     parser.expect(Tag::SemiColon);
 
     parser.close(
-        m,
+        mark,
         match tag {
             Tag::KeywordVar => Tag::DeclVar,
             Tag::KeywordLet => Tag::StmtLet,
             Tag::KeywordConst => Tag::DeclConst,
+            Tag::KeywordOverride => Tag::DeclOverride,
             _ => unreachable!(),
         },
     )
@@ -859,8 +1084,15 @@ fn statement_block(parser: &mut Parser) {
 
 fn statement_block_post_attributes(parser: &mut Parser, mark: OpenMark) {
     parser.expect(Tag::LCurly);
-    while !parser.eof() && !parser.at(Tag::RCurly) {
-        statement(parser);
+    while !parser.at(Tag::Eof) && !parser.at(Tag::RCurly) {
+        if parser.at_any(STATEMENT_FIRST) {
+            statement(parser);
+        } else if parser.at_any(TOP_LEVEL_FIRST) {
+            break;
+        } else {
+            let m = parser.open();
+            parser.advance_with_error(m, Expected::Statement);
+        }
     }
     parser.expect(Tag::RCurly);
     parser.close(mark, Tag::StmtBlock);
@@ -890,9 +1122,11 @@ fn attribute(parser: &mut Parser) {
 fn argument_list(parser: &mut Parser) {
     let m = parser.open();
     parser.expect(Tag::LParen);
-    while !parser.eof() && !parser.at(Tag::RParen) {
+    loop {
         let m = parser.open();
-        expression(parser);
+        if !expression_maybe(parser) {
+            break;
+        }
         if !parser.at(Tag::RParen) {
             parser.expect(Tag::Comma);
         }
@@ -905,12 +1139,18 @@ fn argument_list(parser: &mut Parser) {
 const EXPRESSION_FIRST: TokenSet = EXPRESSION_PRIMARY_FIRST.union(EXPRESSION_UNARY_OP);
 
 fn expression(parser: &mut Parser) {
-    if !parser.at_any(EXPRESSION_PRIMARY_FIRST) {
+    if !expression_maybe(parser) {
         parser.emit_error(Expected::Expression);
-        return;
     }
+}
 
-    expression_infix(parser, 0);
+fn expression_maybe(parser: &mut Parser) -> bool {
+    if parser.at_any(EXPRESSION_FIRST) {
+        expression_infix(parser, 0);
+        true
+    } else {
+        false
+    }
 }
 
 fn expression_infix(parser: &mut Parser, left_binding_power: u8) {
@@ -1056,9 +1296,11 @@ fn identifier_maybe_with_template(parser: &mut Parser) {
 fn template_list(parser: &mut Parser) {
     let m = parser.open();
     parser.expect(Tag::TemplateListStart);
-    while !parser.eof() && !parser.at(Tag::TemplateListEnd) {
+    loop {
         let m = parser.open();
-        expression(parser);
+        if !expression_maybe(parser) {
+            break;
+        }
         if !parser.at(Tag::TemplateListEnd) {
             parser.expect(Tag::Comma);
         }
@@ -1072,7 +1314,7 @@ fn directive_diagnostic(parser: &mut Parser) {
     let m = parser.open();
     assert!(parser.consume(Tag::KeywordDiagnostic));
     parser.expect(Tag::LParen);
-    while !parser.eof() && !parser.at(Tag::RParen) {
+    while parser.at(Tag::Identifier) {
         let m = parser.open();
         parser.expect(Tag::Identifier);
         if parser.consume(Tag::Dot) {
@@ -1091,7 +1333,7 @@ fn directive_diagnostic(parser: &mut Parser) {
 fn directive_enable(parser: &mut Parser) {
     let m = parser.open();
     parser.advance();
-    while !parser.eof() && !parser.at(Tag::SemiColon) {
+    while parser.at(Tag::Identifier) {
         let m = parser.open();
         parser.expect(Tag::Identifier);
         if !parser.at(Tag::SemiColon) {
@@ -1106,7 +1348,7 @@ fn directive_enable(parser: &mut Parser) {
 fn directive_requires(parser: &mut Parser) {
     let m = parser.open();
     parser.advance();
-    while !parser.eof() && !parser.at(Tag::SemiColon) {
+    while parser.at(Tag::Identifier) {
         let m = parser.open();
         parser.expect(Tag::Identifier);
         if !parser.at(Tag::SemiColon) {
@@ -1135,11 +1377,16 @@ mod tests {
         if !output.errors.is_empty() {
             writeln!(text, "===== ERRORS =====").unwrap();
             for error in output.errors.iter() {
-                writeln!(text, "{error:?}").unwrap();
+                let before = &source[..error.token.offset as usize];
+                let line = before.lines().count();
+                let line_start = before.rfind('\n').map(|x| x + 1).unwrap_or(0);
+                let column = before[line_start..].chars().count();
+                writeln!(text, "[{line}:{column}] {}", error.message(source)).unwrap();
             }
+
+            writeln!(text, "===== SYNTAX =====").unwrap();
         }
 
-        writeln!(text, "===== SYNTAX =====").unwrap();
         output
             .tree
             .traverse_pre_order(|_, node, depth| {
@@ -1149,7 +1396,7 @@ mod tests {
                 if node.tag.is_syntax() {
                     writeln!(text, "{:?}", node.tag)
                 } else {
-                    writeln!(text, "{:?} {:?}", node.tag, node.slice(source))
+                    writeln!(text, "{:?} {:?}", node.tag, &source[node.byte_range()])
                 }
             })
             .unwrap();
@@ -1164,7 +1411,6 @@ mod tests {
                 fn main() {}
             "#},
             expect![[r#"
-                ===== SYNTAX =====
                 Root
                   DeclFn
                     KeywordFn "fn"
@@ -1175,6 +1421,71 @@ mod tests {
                     StmtBlock
                       LCurly "{"
                       RCurly "}"
+            "#]],
+        );
+    }
+
+    #[test]
+    fn decl_fn_missing_parens() {
+        check(
+            indoc::indoc! {r#"
+                fn main( {}
+            "#},
+            expect![[r#"
+                ===== ERRORS =====
+                [1:9] expected `)`, but found `{`
+                ===== SYNTAX =====
+                Root
+                  DeclFn
+                    KeywordFn "fn"
+                    Identifier "main"
+                    DeclFnParameterList
+                      LParen "("
+                    StmtBlock
+                      LCurly "{"
+                      RCurly "}"
+            "#]],
+        );
+    }
+
+    #[test]
+    fn block_in_arguments() {
+        check(
+            indoc::indoc! {r#"
+                fn main() {
+                    cross(123{);
+                }
+            "#},
+            expect![[r#"
+                ===== ERRORS =====
+                [2:13] expected `,`, but found `{`
+                [2:13] expected `)`, but found `{`
+                [2:13] expected `;`, but found `{`
+                [2:14] expected a statement, but found `)`
+                [3:0] expected `}`, but found the end of file
+                ===== SYNTAX =====
+                Root
+                  DeclFn
+                    KeywordFn "fn"
+                    Identifier "main"
+                    DeclFnParameterList
+                      LParen "("
+                      RParen ")"
+                    StmtBlock
+                      LCurly "{"
+                      StmtExpr
+                        ExprCall
+                          Identifier "cross"
+                          ArgumentList
+                            LParen "("
+                            Argument
+                              IntegerDecimal "123"
+                      StmtBlock
+                        LCurly "{"
+                        InvalidSyntax
+                          RParen ")"
+                        SemiColon ";"
+                        RCurly "}"
             "#]],
         );
     }

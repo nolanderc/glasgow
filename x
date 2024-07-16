@@ -12,13 +12,12 @@ function build {
 }
 
 function test {
-    export RUST_BACKTRACE=1
-    cargo test "$@"
+    cargo nextest run "$@"
 }
 
 function test-snapshot {
     export UPDATE_EXPECT=1
-    cargo test "$@"
+    cargo nextest run "$@"
 }
 
 function run {
@@ -27,6 +26,10 @@ function run {
 
 function check {
     cargo clippy "$@"
+}
+
+function install {
+    cargo install --path .
 }
 
 function watch {

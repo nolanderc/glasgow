@@ -5,6 +5,8 @@ use std::{
 
 use anyhow::{Context, Result};
 
+use crate::{analyze, syntax::SyntaxNodeMatch as _};
+
 #[derive(Default)]
 pub struct Workspace {
     pub documents: BTreeMap<lsp::Uri, Document>,
@@ -45,6 +47,8 @@ pub struct Document {
 
     parser: Cell<crate::parse::Parser<'static>>,
     parser_output: OnceCell<crate::parse::Output>,
+
+    global_scope: OnceCell<crate::analyze::GlobalScope>,
 }
 
 impl Document {
@@ -56,10 +60,40 @@ impl Document {
     /// Called when the document contents change.
     /// This clears any cached values.
     pub fn reset(&mut self) {
+        self.global_scope.take();
         if let Some(output) = self.parser_output.take() {
             // reuse storage from previous tree
             self.parser.set(self.parser.take().reset(output));
         }
+    }
+
+    pub(crate) fn apply_change(
+        &mut self,
+        change: lsp::TextDocumentContentChangeEvent,
+    ) -> Result<()> {
+        match change.range {
+            None => {
+                self.content = change.text;
+                Ok(())
+            },
+
+            Some(range) => {
+                let OffsetUtf8(start) =
+                    self.offset_utf8_from_position_utf16(range.start).context("invalid range")?;
+                let OffsetUtf8(end) =
+                    self.offset_utf8_from_position_utf16(range.end).context("invalid range")?;
+                self.content.replace_range(start..end, &change.text);
+                Ok(())
+            },
+        }
+    }
+
+    pub fn version(&self) -> Option<i32> {
+        self.version
+    }
+
+    pub(crate) fn set_version(&mut self, version: i32) {
+        self.version = Some(version);
     }
 
     pub(crate) fn content(&self) -> &str {
@@ -116,7 +150,7 @@ impl Document {
         }
 
         if characters_remaining == 0 {
-            Some(offset_line + offset_character)
+            Some(OffsetUtf8(offset_line + offset_character))
         } else {
             None
         }
@@ -140,33 +174,37 @@ impl Document {
         })
     }
 
-    pub(crate) fn apply_change(
-        &mut self,
-        change: lsp::TextDocumentContentChangeEvent,
-    ) -> Result<()> {
-        match change.range {
-            None => {
-                self.content = change.text;
-                Ok(())
-            },
-
-            Some(range) => {
-                let start =
-                    self.offset_utf8_from_position_utf16(range.start).context("invalid range")?;
-                let end =
-                    self.offset_utf8_from_position_utf16(range.end).context("invalid range")?;
-                self.content.replace_range(start..end, &change.text);
-                Ok(())
-            },
-        }
+    pub fn global_scope(&self) -> &crate::analyze::GlobalScope {
+        self.global_scope.get_or_init(|| {
+            let parsed = self.parse();
+            let (scope, _) = crate::analyze::collect_global_scope(&parsed.tree, self.content());
+            scope
+        })
     }
 
-    pub(crate) fn set_version(&mut self, version: i32) {
-        self.version = Some(version);
+    pub fn symbol_at_offset(
+        &self,
+        offset: OffsetUtf8,
+    ) -> Option<(crate::analyze::ResolvedSymbol, crate::parse::NodeIndex)> {
+        let parsed = self.parse();
+
+        let token_path = parsed.tree.token_path_at_offset_utf8(offset.0);
+        let token = *token_path.last()?;
+        assert_eq!(token_path[0], parsed.tree.root_index());
+
+        let decl_index = *token_path.get(1)?;
+        let decl = crate::syntax::Decl::from_tree(&parsed.tree, decl_index)?;
+
+        let global_scope = self.global_scope();
+        let mut context = analyze::ContextDecl::new(global_scope, &parsed.tree, &self.content);
+        context.analyze(decl);
+
+        Some((context.get_node_symbol(token)?, token))
     }
 }
 
-pub type OffsetUtf8 = usize;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct OffsetUtf8(pub usize);
 
 pub type DocumentVersion = i32;
 
@@ -194,7 +232,7 @@ mod tests {
         let check_utf8_from_utf16 = |(line, character), expected: Option<usize>| {
             let position = lsp::Position::new(line, character);
             let offset = document.offset_utf8_from_position_utf16(position);
-            assert_eq!(offset, expected, "at {position:?}");
+            assert_eq!(offset, expected.map(OffsetUtf8), "at {position:?}");
         };
 
         check_utf8_from_utf16((0, 0), Some(0));

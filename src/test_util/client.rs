@@ -1,11 +1,12 @@
-#![cfg(test)]
+use std::cell::Cell;
 
 use anyhow::{anyhow, Context as _, Result};
 
 pub struct Client {
     connection: lsp_server::Connection,
-    server: Option<std::thread::JoinHandle<Result<()>>>,
+    server: Cell<Option<std::thread::JoinHandle<Result<()>>>>,
     next_id: std::cell::Cell<std::num::Wrapping<i32>>,
+    ignore_notifications: bool,
 }
 
 impl Client {
@@ -13,12 +14,18 @@ impl Client {
         tracing_subscriber::fmt().init();
 
         let (client, server) = lsp_server::Connection::memory();
+
         let arguments = <crate::Arguments as clap::Parser>::parse_from([env!("CARGO_BIN_NAME")]);
-        let server = std::thread::spawn(move || crate::run_server(arguments, server));
+        let server = std::thread::Builder::new()
+            .name(format!("{} - server", std::thread::current().name().unwrap_or("???")))
+            .spawn(move || crate::run_server(arguments, server))
+            .expect("could not spawn server thread");
+
         let client = Client {
             connection: client,
-            server: Some(server),
+            server: Cell::new(Some(server)),
             next_id: std::cell::Cell::new(std::num::Wrapping(0)),
+            ignore_notifications: true,
         };
 
         client.request::<lsp::request::Initialize>(lsp::InitializeParams::default());
@@ -51,17 +58,22 @@ impl Client {
             }))
             .context("could not send message to server")?;
 
-        let message =
-            self.connection.receiver.recv().context("could not receive message from server")?;
+        let response = loop {
+            let message =
+                self.connection.receiver.recv().context("could not receive message from server")?;
 
-        let response = match message {
-            lsp_server::Message::Response(response) => response,
-            lsp_server::Message::Request(request) => {
-                return Err(anyhow!("got unexpected request: {request:?}"));
-            },
-            lsp_server::Message::Notification(notification) => {
-                return Err(anyhow!("got unexpected notification: {notification:?}"));
-            },
+            match message {
+                lsp_server::Message::Response(response) => break response,
+                lsp_server::Message::Request(request) => {
+                    return Err(anyhow!("got unexpected request: {request:?}"));
+                },
+                lsp_server::Message::Notification(notification) => {
+                    if self.ignore_notifications {
+                        continue;
+                    }
+                    return Err(anyhow!("got unexpected notification: {notification:?}"));
+                },
+            }
         };
 
         assert_eq!(response.id, id);
@@ -80,7 +92,13 @@ impl Client {
             Result: for<'de> serde::Deserialize<'de>,
         >,
     {
-        self.request_fallible::<R>(params).expect("request failed")
+        match self.request_fallible::<R>(params) {
+            Ok(value) => value,
+            Err(error) => {
+                _ = self.close();
+                panic!("request failed: {error:#}")
+            },
+        }
     }
 
     pub fn notify_fallible<N>(&self, params: N::Params) -> Result<()>
@@ -100,7 +118,13 @@ impl Client {
     where
         N: lsp::notification::Notification<Params: serde::Serialize>,
     {
-        self.notify_fallible::<N>(params).expect("could not send notification")
+        match self.notify_fallible::<N>(params) {
+            Ok(value) => value,
+            Err(error) => {
+                _ = self.close();
+                panic!("could not send notification: {error:#}")
+            },
+        }
     }
 
     pub fn open_document(&self, content: &str) -> lsp::Uri {
@@ -116,7 +140,9 @@ impl Client {
         uri
     }
 
-    pub fn close(&mut self) -> Result<()> {
+    pub fn close(&self) -> Result<()> {
+        let Some(server) = self.server.take() else { return Ok(()) };
+
         let done = std::sync::Mutex::new(false);
         let condition = std::sync::Condvar::new();
 
@@ -139,12 +165,7 @@ impl Client {
                 }
             });
 
-            self.server
-                .take()
-                .unwrap()
-                .join()
-                .expect("server panicked")
-                .expect("server ended with an error");
+            server.join().expect("server panicked").expect("server ended with an error");
 
             *done.lock().unwrap() = true;
             condition.notify_all();
@@ -159,7 +180,7 @@ impl Drop for Client {
         let result = self.close();
         if std::thread::panicking() {
             if let Err(error) = result {
-                eprintln!("\nERROR: could not properly close client connection: {error:?}");
+                eprintln!("\nERROR: could not properly close client connection: {error:#}");
             }
         } else {
             result.expect("could not properly close client connection");
