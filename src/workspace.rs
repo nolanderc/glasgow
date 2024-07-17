@@ -48,7 +48,12 @@ pub struct Document {
     parser: Cell<crate::parse::Parser<'static>>,
     parser_output: OnceCell<crate::parse::Output>,
 
-    global_scope: OnceCell<crate::analyze::GlobalScope>,
+    global_scope: OnceCell<GlobalScopeOutput>,
+}
+
+pub struct GlobalScopeOutput {
+    pub symbols: crate::analyze::GlobalScope,
+    pub errors: BTreeMap<String, crate::analyze::ErrorDuplicate>,
 }
 
 impl Document {
@@ -78,9 +83,9 @@ impl Document {
             },
 
             Some(range) => {
-                let OffsetUtf8(start) =
+                let start =
                     self.offset_utf8_from_position_utf16(range.start).context("invalid range")?;
-                let OffsetUtf8(end) =
+                let end =
                     self.offset_utf8_from_position_utf16(range.end).context("invalid range")?;
                 self.content.replace_range(start..end, &change.text);
                 Ok(())
@@ -150,19 +155,29 @@ impl Document {
         }
 
         if characters_remaining == 0 {
-            Some(OffsetUtf8(offset_line + offset_character))
+            Some(offset_line + offset_character)
         } else {
             None
         }
     }
 
-    pub fn position_utf16_from_offset_utf8(&self, offset: usize) -> Option<lsp::Position> {
+    pub fn position_utf16_from_offset_utf8(&self, offset: OffsetUtf8) -> Option<lsp::Position> {
         let before = self.content.get(..offset)?;
         let line_count = before.bytes().filter(|x| *x == b'\n').count();
         let line_start = before.rfind('\n').map(|x| x + 1).unwrap_or(0);
         let line = &before[line_start..];
         let character_offset = line.chars().map(|x| x.len_utf16()).sum::<usize>();
         Some(lsp::Position { line: line_count as u32, character: character_offset as u32 })
+    }
+
+    pub(crate) fn range_utf16_from_range_utf8(
+        &self,
+        range: std::ops::Range<OffsetUtf8>,
+    ) -> Option<lsp::Range> {
+        Some(lsp::Range {
+            start: self.position_utf16_from_offset_utf8(range.start)?,
+            end: self.position_utf16_from_offset_utf8(range.end)?,
+        })
     }
 
     pub fn parse(&self) -> &crate::parse::Output {
@@ -174,11 +189,12 @@ impl Document {
         })
     }
 
-    pub fn global_scope(&self) -> &crate::analyze::GlobalScope {
+    pub fn global_scope(&self) -> &GlobalScopeOutput {
         self.global_scope.get_or_init(|| {
             let parsed = self.parse();
-            let (scope, _) = crate::analyze::collect_global_scope(&parsed.tree, self.content());
-            scope
+            let (symbols, errors) =
+                crate::analyze::collect_global_scope(&parsed.tree, self.content());
+            GlobalScopeOutput { symbols, errors }
         })
     }
 
@@ -188,23 +204,55 @@ impl Document {
     ) -> Option<(crate::analyze::ResolvedSymbol, crate::parse::NodeIndex)> {
         let parsed = self.parse();
 
-        let token_path = parsed.tree.token_path_at_offset_utf8(offset.0);
+        let token_path = parsed.tree.token_path_at_offset_utf8(offset);
+        let token = *token_path.last()?;
+        assert_eq!(token_path[0], parsed.tree.root_index());
+
+        let decl_index = *token_path.get(1)?;
+        let decl = crate::syntax::Decl::from_tree(&parsed.tree, decl_index)?;
+        if let Some(name) = decl.name(&parsed.tree) {
+            if name.index() == token {
+                let text = &self.content[name.byte_range()];
+                let symbol = crate::analyze::ResolvedSymbol {
+                    name: text.into(),
+                    kind: crate::analyze::ResolvedSymbolKind::User(decl.index()),
+                };
+                return Some((symbol, token));
+            }
+        }
+
+        let global_scope = &self.global_scope().symbols;
+        let mut context = analyze::Context::new(global_scope, &parsed.tree, &self.content);
+        context.analyze_decl(decl);
+
+        Some((context.get_node_symbol(token)?, token))
+    }
+
+    pub fn visible_symbols_at_offset(
+        &self,
+        offset: OffsetUtf8,
+    ) -> Option<(Vec<crate::analyze::ResolvedSymbol>, crate::parse::NodeIndex)> {
+        let parsed = self.parse();
+
+        let token_path = parsed.tree.token_path_at_offset_utf8(offset);
         let token = *token_path.last()?;
         assert_eq!(token_path[0], parsed.tree.root_index());
 
         let decl_index = *token_path.get(1)?;
         let decl = crate::syntax::Decl::from_tree(&parsed.tree, decl_index)?;
 
-        let global_scope = self.global_scope();
-        let mut context = analyze::ContextDecl::new(global_scope, &parsed.tree, &self.content);
-        context.analyze(decl);
+        let global_scope = &self.global_scope().symbols;
+        let mut context = analyze::Context::new(global_scope, &parsed.tree, &self.content);
 
-        Some((context.get_node_symbol(token)?, token))
+        context.capture_symbols_at(token);
+        context.analyze_decl(decl);
+        let symbols = context.get_captured_symbols();
+
+        Some((symbols, token))
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct OffsetUtf8(pub usize);
+pub type OffsetUtf8 = usize;
 
 pub type DocumentVersion = i32;
 
@@ -232,7 +280,7 @@ mod tests {
         let check_utf8_from_utf16 = |(line, character), expected: Option<usize>| {
             let position = lsp::Position::new(line, character);
             let offset = document.offset_utf8_from_position_utf16(position);
-            assert_eq!(offset, expected.map(OffsetUtf8), "at {position:?}");
+            assert_eq!(offset, expected, "at {position:?}");
         };
 
         check_utf8_from_utf16((0, 0), Some(0));

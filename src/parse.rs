@@ -440,7 +440,8 @@ impl Tree {
             let node = nodes[curr.0 as usize];
 
             if node.tag.is_token() {
-                if node.byte_range().contains(&offset) {
+                let range = node.byte_range();
+                if range.start <= offset && offset <= range.end {
                     callback(curr as NodeIndex);
                     return true;
                 } else {
@@ -454,7 +455,7 @@ impl Tree {
                 let c = nodes[child.0 as usize];
                 if c.tag.is_token() {
                     let range = c.byte_range();
-                    if range.end <= offset {
+                    if range.end < offset {
                         candidate_children.start = child.0 as usize + 1;
                         break;
                     }
@@ -464,7 +465,7 @@ impl Tree {
                 }
             }
 
-            for child in candidate_children {
+            for child in candidate_children.rev() {
                 if find_in_node(nodes, NodeIndex(child as u32), offset, callback) {
                     callback(curr as NodeIndex);
                     return true;
@@ -477,21 +478,24 @@ impl Tree {
         find_in_node(&self.nodes, self.root_index(), offset, &mut callback)
     }
 
-    pub fn token_at_offset_utf8(&self, offset: usize) -> Option<NodeIndex> {
-        let mut first = None;
-        self.enumerate_token_path_at_offset_utf8(offset, |index| {
-            if first.is_none() {
-                first = Some(index);
-            }
-        });
-        first
-    }
-
     pub fn token_path_at_offset_utf8(&self, offset: usize) -> Vec<NodeIndex> {
         let mut path = Vec::new();
         self.enumerate_token_path_at_offset_utf8(offset, |index| path.push(index));
         path.reverse();
         path
+    }
+
+    pub fn parent(&self, index: NodeIndex) -> Option<NodeIndex> {
+        for candidate in index.0 as usize + 1..self.nodes.len() {
+            let node = self.nodes[candidate];
+            if node.is_syntax() {
+                let children = node.children_range();
+                if children.contains(&(index.0 as usize)) {
+                    return Some(NodeIndex(candidate as u32));
+                }
+            }
+        }
+        None
     }
 }
 

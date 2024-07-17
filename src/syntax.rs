@@ -127,12 +127,12 @@ macro_rules! syntax_node_enum {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct Token<const TAG: u8>(SyntaxNode);
+pub struct TokenNode<const TAG: u8>(SyntaxNode);
 
-impl<const TAG: u8> SyntaxNodeMatch for Token<TAG> {
+impl<const TAG: u8> SyntaxNodeMatch for TokenNode<TAG> {
     fn new(node: SyntaxNode) -> Option<Self> {
         if node.parse.tag() as u8 == TAG {
-            Some(Token(node))
+            Some(TokenNode(node))
         } else {
             None
         }
@@ -143,7 +143,7 @@ impl<const TAG: u8> SyntaxNodeMatch for Token<TAG> {
     }
 }
 
-impl<const TAG: u8> Token<TAG> {
+impl<const TAG: u8> TokenNode<TAG> {
     pub fn byte_range(self) -> std::ops::Range<usize> {
         self.0.parse.byte_range()
     }
@@ -151,9 +151,11 @@ impl<const TAG: u8> Token<TAG> {
 
 macro_rules! Token {
     ($tag:ident) => {
-        Token<{ parse::Tag::$tag as u8 }>
+        $crate::syntax::TokenNode<{ parse::Tag::$tag as u8 }>
     };
 }
+
+pub(crate) use Token;
 
 pub fn root(tree: &Tree) -> Root {
     Root::new(SyntaxNode { parse: tree.root(), index: tree.root_index() })
@@ -178,6 +180,18 @@ syntax_node_enum!(
         Fn(DeclFn),
     }
 );
+impl Decl {
+    pub fn name(self, tree: &Tree) -> Option<Token!(Identifier)> {
+        match self {
+            Decl::Alias(alias) => alias.extract(tree).name,
+            Decl::Struct(strukt) => strukt.extract(tree).name,
+            Decl::Const(konst) => konst.extract(tree).name,
+            Decl::Override(overide) => overide.extract(tree).name,
+            Decl::Var(war) => war.extract(tree).name,
+            Decl::Fn(func) => func.extract(tree).name,
+        }
+    }
+}
 
 syntax_node_simple!(
     DeclAlias,
@@ -256,9 +270,31 @@ syntax_node_simple!(
     }
 );
 syntax_node_simple!(DeclFnParameterList);
+syntax_node_simple!(
+    DeclFnParameter,
+    struct DeclFnParameterFields {
+        attributes: AttributeList,
+        name: Token!(Identifier),
+        colon_token: Token!(Colon),
+        typ: TypeSpecifier,
+    }
+);
 syntax_node_simple!(DeclFnOutput);
 
 syntax_node_simple!(StmtBlock);
+
+syntax_node_simple!(
+    StmtLet,
+    struct StmtLetFields {
+        let_token: Token!(KeywordLet),
+        name: Token!(Identifier),
+        colon_token: Token!(Colon),
+        typ: TypeSpecifier,
+        equal_token: Token!(Equal),
+        value: Expression,
+        semi_token: Token!(SemiColon),
+    }
+);
 
 syntax_node_enum!(
     enum Expression {

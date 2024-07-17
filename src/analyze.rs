@@ -5,7 +5,7 @@ use std::{
 
 use crate::{
     parse,
-    syntax::{self, SyntaxNodeMatch as _},
+    syntax::{self, SyntaxNodeMatch},
 };
 
 static BUILTIN_FUNCTIONS: std::sync::OnceLock<wgsl_spec::FunctionInfo> = std::sync::OnceLock::new();
@@ -21,6 +21,12 @@ pub type GlobalScope = HashMap<String, GlobalDeclaration>;
 #[derive(Debug, Clone, Copy)]
 pub struct GlobalDeclaration {
     pub node: parse::NodeIndex,
+}
+
+impl GlobalDeclaration {
+    pub fn name(&self, tree: &parse::Tree) -> Option<syntax::Token!(Identifier)> {
+        syntax::Decl::from_tree(tree, self.node).unwrap().name(tree)
+    }
 }
 
 /// Found a declaration that conflicts with the name of another declaration.
@@ -64,7 +70,7 @@ pub fn collect_global_scope(
     (scope, errors)
 }
 
-pub struct ContextDecl<'a> {
+pub struct Context<'a> {
     builtin_functions: &'static wgsl_spec::FunctionInfo,
     global_scope: &'a GlobalScope,
     tree: &'a parse::Tree,
@@ -76,6 +82,16 @@ pub struct ContextDecl<'a> {
 
     /// identifiers which have had their reference resolved.
     references: HashMap<parse::NodeIndex, Reference>,
+
+    /// If set, we should record a capture of the visible symbols during name resolution.
+    capture: Option<CaptureSymbols<'a>>,
+}
+
+struct CaptureSymbols<'a> {
+    /// At which node we should perform the capture.
+    node: parse::NodeIndex,
+    /// The references we captured during name resolution.
+    references: Vec<(&'a str, Reference)>,
 }
 
 #[derive(Debug)]
@@ -94,7 +110,7 @@ pub struct ErrorUnresolvedReference {
     pub node: parse::NodeIndex,
 }
 
-impl<'a> ContextDecl<'a> {
+impl<'a> Context<'a> {
     pub fn new(global_scope: &'a GlobalScope, tree: &'a parse::Tree, source: &'a str) -> Self {
         Self {
             builtin_functions: get_builtin_functions(),
@@ -104,23 +120,84 @@ impl<'a> ContextDecl<'a> {
             scope: Scope::new(),
             errors: Vec::new(),
             references: HashMap::new(),
+
+            capture: None,
         }
     }
 
-    pub fn analyze(&mut self, decl: syntax::Decl) -> &mut Vec<Error> {
-        self.resolve_references(decl.index());
+    pub(crate) fn reset(&mut self) {
+        self.scope.reset();
+        self.references.clear();
+        self.capture.take();
+        self.errors.clear();
+    }
+
+    pub fn analyze_decl(&mut self, decl: syntax::Decl) -> &mut Vec<Error> {
+        // name resolution:
+        {
+            let scope_root = self.scope.begin();
+            self.resolve_references(decl.index());
+            self.scope.end(scope_root);
+        }
+
         &mut self.errors
     }
 
     pub fn get_node_symbol(&self, node: parse::NodeIndex) -> Option<ResolvedSymbol> {
         let reference = self.references.get(&node)?;
-        match reference {
-            Reference::Node(_) => None,
-            Reference::BuiltinFunction(function) => Some(ResolvedSymbol::BuiltinFunction(function)),
+        let kind = match reference {
+            Reference::Node(node) => ResolvedSymbolKind::User(*node),
+            Reference::BuiltinFunction(function) => ResolvedSymbolKind::BuiltinFunction(function),
+        };
+        Some(ResolvedSymbol { name: self.source[self.tree.node(node).byte_range()].into(), kind })
+    }
+
+    pub fn capture_symbols_at(&mut self, node: parse::NodeIndex) {
+        self.capture = Some(CaptureSymbols { node, references: Vec::new() });
+    }
+
+    pub fn get_captured_symbols(&self) -> Vec<ResolvedSymbol> {
+        let Some(capture) = &self.capture else { return Vec::new() };
+        let mut symbols = Vec::with_capacity(capture.references.len());
+
+        for (name, reference) in capture.references.iter() {
+            symbols.push(ResolvedSymbol {
+                name: (*name).into(),
+                kind: match reference {
+                    Reference::Node(node) => ResolvedSymbolKind::User(*node),
+                    Reference::BuiltinFunction(function) => {
+                        ResolvedSymbolKind::BuiltinFunction(function)
+                    },
+                },
+            });
+        }
+
+        symbols
+    }
+
+    #[cold]
+    fn capture_symbols(&mut self) {
+        let Some(capture) = &mut self.capture else { return };
+        for (name, node) in self.scope.iter_symbols() {
+            capture.references.push((name, Reference::Node(node)));
+        }
+
+        for (name, decl) in self.global_scope.iter() {
+            capture.references.push((name, Reference::Node(decl.node)))
+        }
+
+        for (name, function) in self.builtin_functions.functions.iter() {
+            capture.references.push((name, Reference::BuiltinFunction(function)))
         }
     }
 
     fn resolve_references(&mut self, index: parse::NodeIndex) {
+        if let Some(capture) = &mut self.capture {
+            if index == capture.node {
+                self.capture_symbols();
+            }
+        }
+
         let node = self.tree.node(index);
         match node.tag() {
             parse::Tag::Identifier => {
@@ -138,18 +215,12 @@ impl<'a> ContextDecl<'a> {
                 }
             },
 
-            parse::Tag::StmtBlock => {
-                let block_scope = self.scope.begin();
-                for child in node.children() {
-                    self.resolve_references(child);
-                }
-                self.scope.end(block_scope);
-            },
-
             parse::Tag::Attribute => {
                 // don't attempt to resolve the attribute name
                 let syntax_node = syntax::SyntaxNode::new(node, index);
                 let attribute = syntax::Attribute::new(syntax_node).unwrap();
+
+                // TODO: introduce context-dependent names
                 if let Some(arguments) = attribute.extract(self.tree).arguments {
                     self.resolve_references(arguments.index());
                 }
@@ -159,6 +230,37 @@ impl<'a> ContextDecl<'a> {
                 // members cannot be resolved until types are known, so ignore this for now
             },
 
+            parse::Tag::StmtBlock => {
+                let block_scope = self.scope.begin();
+                for child in node.children() {
+                    self.resolve_references(child);
+                }
+                self.scope.end(block_scope);
+            },
+
+            parse::Tag::DeclConst => {
+                let konst = syntax::DeclConst::new(syntax::SyntaxNode::new(node, index)).unwrap();
+                let fields = konst.extract(self.tree);
+                self.resolve_variable_declaration(index, fields.name, fields.typ, fields.value);
+            },
+            parse::Tag::DeclVar => {
+                let war = syntax::DeclVar::new(syntax::SyntaxNode::new(node, index)).unwrap();
+                let fields = war.extract(self.tree);
+                self.resolve_variable_declaration(index, fields.name, fields.typ, fields.value);
+            },
+            parse::Tag::StmtLet => {
+                let lett = syntax::StmtLet::new(syntax::SyntaxNode::new(node, index)).unwrap();
+                let fields = lett.extract(self.tree);
+                self.resolve_variable_declaration(index, fields.name, fields.typ, fields.value);
+            },
+
+            parse::Tag::DeclFnParameter => {
+                let param =
+                    syntax::DeclFnParameter::new(syntax::SyntaxNode::new(node, index)).unwrap();
+                let fields = param.extract(self.tree);
+                self.resolve_variable_declaration(index, fields.name, fields.typ, None);
+            },
+
             tag => {
                 if tag.is_syntax() {
                     for child in node.children() {
@@ -166,6 +268,28 @@ impl<'a> ContextDecl<'a> {
                     }
                 }
             },
+        }
+    }
+
+    fn resolve_variable_declaration(
+        &mut self,
+        index: parse::NodeIndex,
+        name: Option<syntax::Token!(Identifier)>,
+        typ: Option<syntax::TypeSpecifier>,
+        value: Option<syntax::Expression>,
+    ) {
+        if let Some(name) = name {
+            let text = &self.source[name.byte_range()];
+            self.scope.insert(text, index);
+            self.references.insert(name.index(), Reference::Node(index));
+        }
+        self.resolve_references_maybe(typ);
+        self.resolve_references_maybe(value);
+    }
+
+    fn resolve_references_maybe(&mut self, index: Option<impl syntax::SyntaxNodeMatch>) {
+        if let Some(index) = index {
+            self.resolve_references(index.index());
         }
     }
 }
@@ -193,12 +317,10 @@ impl<'a> Scope<'a> {
         Scope { symbols: HashMap::new(), next_scope: ScopeId(0), active_scopes: Vec::new() }
     }
 
-    fn is_active(target: ScopeId, scopes: &[ScopeId]) -> bool {
-        if scopes.len() < 16 {
-            scopes.iter().rev().any(|x| *x == target)
-        } else {
-            scopes.binary_search(&target).is_ok()
-        }
+    fn reset(&mut self) {
+        self.symbols.clear();
+        self.active_scopes.clear();
+        self.next_scope = ScopeId(0);
     }
 
     pub fn begin(&mut self) -> ScopeId {
@@ -227,18 +349,52 @@ impl<'a> Scope<'a> {
     }
 
     pub fn get(&mut self, name: &'a str) -> Option<parse::NodeIndex> {
-        let slot = self.symbols.get_mut(name)?;
+        use std::collections::hash_map::Entry;
+        let Entry::Occupied(mut entry) = self.symbols.entry(name) else { return None };
+
+        match Self::get_slot(entry.get_mut(), &self.active_scopes) {
+            Some(node) => Some(node),
+            None => {
+                entry.remove();
+                None
+            },
+        }
+    }
+
+    fn get_slot(slot: &mut ScopeSymbol, active_scopes: &[ScopeId]) -> Option<parse::NodeIndex> {
         loop {
-            if Self::is_active(slot.scope, &self.active_scopes) {
+            if Self::is_active(slot.scope, active_scopes) {
                 return Some(slot.node);
             }
             *slot = *slot.shadowed.take()?;
         }
     }
+
+    fn is_active(target: ScopeId, scopes: &[ScopeId]) -> bool {
+        if scopes.len() < 16 {
+            scopes.iter().rev().any(|x| *x == target)
+        } else {
+            scopes.binary_search(&target).is_ok()
+        }
+    }
+
+    fn iter_symbols(&mut self) -> impl Iterator<Item = (&'a str, parse::NodeIndex)> + '_ {
+        self.symbols.iter_mut().filter_map(|(name, slot)| {
+            let node = Self::get_slot(slot, &self.active_scopes)?;
+            Some((*name, node))
+        })
+    }
 }
 
 #[derive(Debug)]
-pub enum ResolvedSymbol {
+pub struct ResolvedSymbol {
+    pub name: String,
+    pub kind: ResolvedSymbolKind,
+}
+
+#[derive(Debug)]
+pub enum ResolvedSymbolKind {
+    User(parse::NodeIndex),
     BuiltinFunction(&'static wgsl_spec::Function),
 }
 

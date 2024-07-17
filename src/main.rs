@@ -12,7 +12,9 @@ use std::{
 };
 
 use anyhow::{Context as _, Result};
-use lsp::notification::Notification as _;
+use lsp::{notification::Notification as _, CompletionItemKind};
+
+use crate::syntax::SyntaxNodeMatch;
 
 #[derive(Debug, clap::Parser)]
 struct Arguments {
@@ -104,31 +106,6 @@ fn add_routes(router: &mut Router) {
 
     router.handle_notice::<lsp::notification::DidSaveTextDocument>(|_state, _notice| Ok(()));
 
-    router.handle_request::<lsp::request::HoverRequest>(|state, request| {
-        let location = &request.text_document_position_params;
-        let document = state.workspace.document_mut(&location.text_document.uri)?;
-        let offset = document
-            .offset_utf8_from_position_utf16(location.position)
-            .context("invalid position")?;
-
-        let Some((symbol, token)) = document.symbol_at_offset(offset) else { return Ok(None) };
-
-        let parsed = document.parse();
-        let range = parsed.tree.node(token).byte_range();
-        let markdown = symbol_documentation(symbol)?;
-
-        Ok(Some(lsp::Hover {
-            range: Some(lsp::Range {
-                start: document.position_utf16_from_offset_utf8(range.start).unwrap(),
-                end: document.position_utf16_from_offset_utf8(range.end).unwrap(),
-            }),
-            contents: lsp::HoverContents::Markup(lsp::MarkupContent {
-                kind: lsp::MarkupKind::Markdown,
-                value: markdown,
-            }),
-        }))
-    });
-
     router.handle_request::<lsp::request::DocumentDiagnosticRequest>(|state, request| {
         let diagnostics = collect_diagnostics(state, &request.text_document.uri)?;
         Ok(lsp::DocumentDiagnosticReportResult::Report(lsp::DocumentDiagnosticReport::Full(
@@ -141,13 +118,69 @@ fn add_routes(router: &mut Router) {
             },
         )))
     });
+
+    router.handle_request::<lsp::request::HoverRequest>(|state, request| {
+        let location = &request.text_document_position_params;
+        let document = state.workspace.document(&location.text_document.uri)?;
+        let offset = document
+            .offset_utf8_from_position_utf16(location.position)
+            .context("invalid position")?;
+
+        let Some((symbol, token)) = document.symbol_at_offset(offset) else { return Ok(None) };
+
+        let parsed = document.parse();
+        let range = parsed.tree.node(token).byte_range();
+        let documentation = symbol_documentation(document, &symbol.kind)?;
+
+        Ok(Some(lsp::Hover {
+            range: document.range_utf16_from_range_utf8(range),
+            contents: lsp::HoverContents::Markup(documentation),
+        }))
+    });
+
+    router.handle_request::<lsp::request::Completion>(|state, request| {
+        let location = &request.text_document_position;
+        let document = state.workspace.document(&location.text_document.uri)?;
+        let offset = document
+            .offset_utf8_from_position_utf16(location.position)
+            .context("invalid position")?;
+
+        let Some((symbols, _token)) = document.visible_symbols_at_offset(offset) else {
+            return Ok(None);
+        };
+
+        let mut completions = Vec::with_capacity(symbols.len());
+
+        for symbol in symbols {
+            let mut item = lsp::CompletionItem { label: symbol.name, ..Default::default() };
+
+            match &symbol.kind {
+                analyze::ResolvedSymbolKind::User(_) => {
+                    item.documentation = Some(lsp::Documentation::MarkupContent(
+                        symbol_documentation(document, &symbol.kind)?,
+                    ));
+                },
+
+                analyze::ResolvedSymbolKind::BuiltinFunction(_function) => {
+                    item.kind = Some(CompletionItemKind::FUNCTION);
+                    item.documentation = Some(lsp::Documentation::MarkupContent(
+                        symbol_documentation(document, &symbol.kind)?,
+                    ));
+                },
+            }
+
+            completions.push(item);
+        }
+
+        Ok(Some(lsp::CompletionResponse::Array(completions)))
+    })
 }
 
 fn publish_diagnostics_for_document(
     state: &mut State,
     document_id: lsp::VersionedTextDocumentIdentifier,
 ) -> Result<()> {
-    let document = state.workspace.document_mut(&document_id.uri)?;
+    let document = state.workspace.document(&document_id.uri)?;
     if document.version() != Some(document_id.version) {
         tracing::info!("document out of date");
         // document is out-of-date
@@ -164,13 +197,88 @@ fn publish_diagnostics_for_document(
     Ok(())
 }
 
-fn symbol_documentation(symbol: analyze::ResolvedSymbol) -> Result<String> {
+fn collect_diagnostics(state: &State, uri: &lsp::Uri) -> Result<Vec<lsp::Diagnostic>> {
+    let mut diagnostics = Vec::new();
+
+    let document = state.workspace.document(uri)?;
+
+    let parsed = document.parse();
+    for error in parsed.errors.clone().iter() {
+        diagnostics.push(lsp::Diagnostic {
+            range: document.range_utf16_from_range_utf8(error.token.byte_range()).unwrap(),
+            severity: Some(lsp::DiagnosticSeverity::ERROR),
+            source: Some("syntax".into()),
+            message: error.message(document.content()),
+            ..Default::default()
+        });
+    }
+
+    let global_scope = document.global_scope();
+    for (name, duplicate) in global_scope.errors.iter() {
+        for conflict in duplicate.conflicts.iter() {
+            let Some(ident) = conflict.name(&parsed.tree) else { continue };
+            diagnostics.push(lsp::Diagnostic {
+                range: document.range_utf16_from_range_utf8(ident.byte_range()).unwrap(),
+                severity: Some(lsp::DiagnosticSeverity::ERROR),
+                message: format!("multiple declarations with the name `{name}`"),
+                ..Default::default()
+            })
+        }
+    }
+
+    let mut context =
+        crate::analyze::Context::new(&global_scope.symbols, &parsed.tree, document.content());
+    for decl in syntax::root(&parsed.tree).decls(&parsed.tree) {
+        context.reset();
+        let errors = context.analyze_decl(decl);
+        for error in errors {
+            match error {
+                analyze::Error::UnresolvedReference(unresolved) => {
+                    let node = parsed.tree.node(unresolved.node);
+                    let text = &document.content()[node.byte_range()];
+                    let byte_range = node.byte_range();
+                    diagnostics.push(lsp::Diagnostic {
+                        range: document.range_utf16_from_range_utf8(byte_range).unwrap(),
+                        severity: Some(lsp::DiagnosticSeverity::ERROR),
+                        message: format!("unresolved reference to `{text}`"),
+                        ..Default::default()
+                    });
+                },
+            }
+        }
+    }
+
+    Ok(diagnostics)
+}
+
+fn symbol_documentation(
+    document: &workspace::Document,
+    symbol: &analyze::ResolvedSymbolKind,
+) -> Result<lsp::MarkupContent> {
     use std::fmt::Write;
 
     let mut markdown = String::new();
 
     match symbol {
-        analyze::ResolvedSymbol::BuiltinFunction(function) => {
+        &analyze::ResolvedSymbolKind::User(node) => {
+            let tree = &document.parse().tree;
+            if let Some(decl) = syntax::Decl::from_tree(tree, node) {
+                if let Some(name) = decl.name(tree) {
+                    let text = &document.content()[name.byte_range()];
+                    writeln!(markdown, "`{text}`")?;
+                }
+            }
+
+            if let Some(lett) = syntax::StmtLet::from_tree(tree, node) {
+                let fields = lett.extract(tree);
+                if let Some(name) = fields.name {
+                    let text = &document.content()[name.byte_range()];
+                    writeln!(markdown, "`{text}`")?;
+                }
+            }
+        },
+
+        analyze::ResolvedSymbolKind::BuiltinFunction(function) => {
             if let Some(description) = &function.description {
                 writeln!(markdown, "{}", description)?;
                 writeln!(markdown)?;
@@ -221,40 +329,13 @@ fn symbol_documentation(symbol: analyze::ResolvedSymbol) -> Result<String> {
         },
     }
 
-    Ok(markdown)
-}
-
-fn collect_diagnostics(state: &State, uri: &lsp::Uri) -> Result<Vec<lsp::Diagnostic>> {
-    let mut diagnostics = Vec::new();
-
-    let document = state.workspace.document(uri)?;
-    let parsed = document.parse();
-    for error in parsed.errors.clone().iter() {
-        let byte_range = error.token.byte_range();
-        diagnostics.push(lsp::Diagnostic {
-            range: lsp::Range {
-                start: document.position_utf16_from_offset_utf8(byte_range.start).unwrap(),
-                end: document.position_utf16_from_offset_utf8(byte_range.end).unwrap(),
-            },
-            severity: Some(lsp::DiagnosticSeverity::ERROR),
-            code: None,
-            code_description: None,
-            source: Some("syntax".into()),
-            message: error.message(document.content()),
-            related_information: None,
-            tags: None,
-            data: None,
-        });
-    }
-
-    Ok(diagnostics)
+    Ok(lsp::MarkupContent { kind: lsp::MarkupKind::Markdown, value: markdown })
 }
 
 fn run_server(_arguments: Arguments, connection: lsp_server::Connection) -> Result<()> {
     tracing::info!("starting server");
 
     let server_capabilities = lsp::ServerCapabilities {
-        hover_provider: Some(lsp::HoverProviderCapability::Simple(true)),
         text_document_sync: Some(lsp::TextDocumentSyncCapability::Kind(
             lsp::TextDocumentSyncKind::FULL,
         )),
@@ -266,6 +347,14 @@ fn run_server(_arguments: Arguments, connection: lsp_server::Connection) -> Resu
                 work_done_progress_options: Default::default(),
             },
         )),
+        hover_provider: Some(lsp::HoverProviderCapability::Simple(true)),
+        completion_provider: Some(lsp::CompletionOptions {
+            resolve_provider: None,
+            trigger_characters: None,
+            all_commit_characters: None,
+            work_done_progress_options: Default::default(),
+            completion_item: None,
+        }),
         ..Default::default()
     };
 
