@@ -9,6 +9,7 @@ use crate::{
 };
 
 static BUILTIN_FUNCTIONS: std::sync::OnceLock<wgsl_spec::FunctionInfo> = std::sync::OnceLock::new();
+static BUILTIN_TOKENS: std::sync::OnceLock<wgsl_spec::TokenInfo> = std::sync::OnceLock::new();
 
 fn get_builtin_functions() -> &'static wgsl_spec::FunctionInfo {
     BUILTIN_FUNCTIONS.get_or_init(|| {
@@ -16,16 +17,22 @@ fn get_builtin_functions() -> &'static wgsl_spec::FunctionInfo {
     })
 }
 
+fn get_builtin_tokens() -> &'static wgsl_spec::TokenInfo {
+    BUILTIN_TOKENS.get_or_init(|| {
+        wgsl_spec::include::tokens().expect("could not load builtin token defintitions")
+    })
+}
+
 pub type GlobalScope = HashMap<String, GlobalDeclaration>;
 
 #[derive(Debug, Clone, Copy)]
 pub struct GlobalDeclaration {
-    pub node: parse::NodeIndex,
+    pub node: ReferenceNode,
 }
 
 impl GlobalDeclaration {
     pub fn name(&self, tree: &parse::Tree) -> Option<syntax::Token!(Identifier)> {
-        syntax::Decl::from_tree(tree, self.node).unwrap().name(tree)
+        self.node.name(tree)
     }
 }
 
@@ -45,24 +52,16 @@ pub fn collect_global_scope(
     let mut errors = BTreeMap::new();
 
     for decl in root.decls(tree) {
-        let (name, index) = match decl {
-            syntax::Decl::Alias(alias) => (alias.extract(tree).name, alias.index()),
-            syntax::Decl::Struct(strukt) => (strukt.extract(tree).name, strukt.index()),
-            syntax::Decl::Const(konst) => (konst.extract(tree).name, konst.index()),
-            syntax::Decl::Override(overide) => (overide.extract(tree).name, overide.index()),
-            syntax::Decl::Var(war) => (war.extract(tree).name, war.index()),
-            syntax::Decl::Fn(func) => (func.extract(tree).name, func.index()),
-        };
-
-        if let Some(name) = name {
+        let node = ReferenceNode::from(decl);
+        if let Some(name) = node.name(tree) {
             let text = &source[name.byte_range()];
-            let decl = GlobalDeclaration { node: index };
-            if let Some(previous) = scope.insert(text.into(), decl) {
+            let global = GlobalDeclaration { node };
+            if let Some(previous) = scope.insert(text.into(), global) {
                 errors
                     .entry(text.into())
                     .or_insert_with(|| ErrorDuplicate { conflicts: vec![previous] })
                     .conflicts
-                    .push(decl);
+                    .push(global);
             }
         }
     }
@@ -72,6 +71,8 @@ pub fn collect_global_scope(
 
 pub struct Context<'a> {
     builtin_functions: &'static wgsl_spec::FunctionInfo,
+    builtin_tokens: &'static wgsl_spec::TokenInfo,
+
     global_scope: &'a GlobalScope,
     tree: &'a parse::Tree,
     source: &'a str,
@@ -94,10 +95,79 @@ struct CaptureSymbols<'a> {
     references: Vec<(&'a str, Reference)>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 enum Reference {
-    Node(parse::NodeIndex),
+    Node(ReferenceNode),
     BuiltinFunction(&'static wgsl_spec::Function),
+    BuiltinTypeAlias(&'static String, &'static String),
+}
+
+impl From<Reference> for ResolvedSymbolKind {
+    fn from(value: Reference) -> Self {
+        match value {
+            Reference::Node(node) => ResolvedSymbolKind::User(node),
+            Reference::BuiltinFunction(function) => ResolvedSymbolKind::BuiltinFunction(function),
+            Reference::BuiltinTypeAlias(name, original) => {
+                ResolvedSymbolKind::BuiltinTypeAlias(name, original)
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum ReferenceNode {
+    Alias(syntax::DeclAlias),
+    Struct(syntax::DeclStruct),
+    StructField(syntax::DeclStructField),
+    Const(syntax::DeclConst),
+    Override(syntax::DeclOverride),
+    Var(syntax::DeclVar),
+    Fn(syntax::DeclFn),
+    FnParameter(syntax::DeclFnParameter),
+    Let(syntax::StmtLet),
+}
+
+impl From<syntax::Decl> for ReferenceNode {
+    fn from(decl: syntax::Decl) -> ReferenceNode {
+        match decl {
+            syntax::Decl::Alias(x) => ReferenceNode::Alias(x),
+            syntax::Decl::Struct(x) => ReferenceNode::Struct(x),
+            syntax::Decl::Const(x) => ReferenceNode::Const(x),
+            syntax::Decl::Override(x) => ReferenceNode::Override(x),
+            syntax::Decl::Var(x) => ReferenceNode::Var(x),
+            syntax::Decl::Fn(x) => ReferenceNode::Fn(x),
+        }
+    }
+}
+
+impl ReferenceNode {
+    pub fn raw(self) -> syntax::SyntaxNode {
+        match self {
+            ReferenceNode::Fn(x) => x.node(),
+            ReferenceNode::Alias(x) => x.node(),
+            ReferenceNode::Struct(x) => x.node(),
+            ReferenceNode::StructField(x) => x.node(),
+            ReferenceNode::Const(x) => x.node(),
+            ReferenceNode::Override(x) => x.node(),
+            ReferenceNode::Var(x) => x.node(),
+            ReferenceNode::FnParameter(x) => x.node(),
+            ReferenceNode::Let(x) => x.node(),
+        }
+    }
+
+    pub fn name(self, tree: &parse::Tree) -> Option<syntax::Token!(Identifier)> {
+        match self {
+            ReferenceNode::Alias(x) => x.extract(tree).name,
+            ReferenceNode::Struct(x) => x.extract(tree).name,
+            ReferenceNode::StructField(x) => x.extract(tree).name,
+            ReferenceNode::Const(x) => x.extract(tree).name,
+            ReferenceNode::Override(x) => x.extract(tree).name,
+            ReferenceNode::Var(x) => x.extract(tree).name,
+            ReferenceNode::Fn(x) => x.extract(tree).name,
+            ReferenceNode::FnParameter(x) => x.extract(tree).name,
+            ReferenceNode::Let(x) => x.extract(tree).name,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -114,6 +184,8 @@ impl<'a> Context<'a> {
     pub fn new(global_scope: &'a GlobalScope, tree: &'a parse::Tree, source: &'a str) -> Self {
         Self {
             builtin_functions: get_builtin_functions(),
+            builtin_tokens: get_builtin_tokens(),
+
             global_scope,
             tree,
             source,
@@ -148,6 +220,9 @@ impl<'a> Context<'a> {
         let kind = match reference {
             Reference::Node(node) => ResolvedSymbolKind::User(*node),
             Reference::BuiltinFunction(function) => ResolvedSymbolKind::BuiltinFunction(function),
+            Reference::BuiltinTypeAlias(name, original) => {
+                ResolvedSymbolKind::BuiltinTypeAlias(name, original)
+            },
         };
         Some(ResolvedSymbol { name: self.source[self.tree.node(node).byte_range()].into(), kind })
     }
@@ -161,15 +236,7 @@ impl<'a> Context<'a> {
         let mut symbols = Vec::with_capacity(capture.references.len());
 
         for (name, reference) in capture.references.iter() {
-            symbols.push(ResolvedSymbol {
-                name: (*name).into(),
-                kind: match reference {
-                    Reference::Node(node) => ResolvedSymbolKind::User(*node),
-                    Reference::BuiltinFunction(function) => {
-                        ResolvedSymbolKind::BuiltinFunction(function)
-                    },
-                },
-            });
+            symbols.push(ResolvedSymbol { name: (*name).into(), kind: (*reference).into() });
         }
 
         symbols
@@ -188,6 +255,10 @@ impl<'a> Context<'a> {
 
         for (name, function) in self.builtin_functions.functions.iter() {
             capture.references.push((name, Reference::BuiltinFunction(function)))
+        }
+
+        for (name, original) in self.builtin_tokens.type_aliases.iter() {
+            capture.references.push((name, Reference::BuiltinTypeAlias(name, original)))
         }
     }
 
@@ -209,6 +280,10 @@ impl<'a> Context<'a> {
                     self.references.insert(index, Reference::Node(global.node));
                 } else if let Some(builtin) = self.builtin_functions.functions.get(name) {
                     self.references.insert(index, Reference::BuiltinFunction(builtin));
+                } else if let Some((name, original)) =
+                    self.builtin_tokens.type_aliases.get_key_value(name)
+                {
+                    self.references.insert(index, Reference::BuiltinTypeAlias(name, original));
                 } else {
                     self.errors
                         .push(Error::UnresolvedReference(ErrorUnresolvedReference { node: index }));
@@ -221,8 +296,8 @@ impl<'a> Context<'a> {
                 let attribute = syntax::Attribute::new(syntax_node).unwrap();
 
                 // TODO: introduce context-dependent names
-                if let Some(arguments) = attribute.extract(self.tree).arguments {
-                    self.resolve_references(arguments.index());
+                if let Some(_arguments) = attribute.extract(self.tree).arguments {
+                    // self.resolve_references(arguments.index());
                 }
             },
 
@@ -240,25 +315,57 @@ impl<'a> Context<'a> {
 
             parse::Tag::DeclConst => {
                 let konst = syntax::DeclConst::new(syntax::SyntaxNode::new(node, index)).unwrap();
-                let fields = konst.extract(self.tree);
-                self.resolve_variable_declaration(index, fields.name, fields.typ, fields.value);
+                let data = konst.extract(self.tree);
+                self.resolve_variable_declaration(
+                    ReferenceNode::Const(konst),
+                    data.name,
+                    data.typ,
+                    data.value,
+                );
             },
             parse::Tag::DeclVar => {
                 let war = syntax::DeclVar::new(syntax::SyntaxNode::new(node, index)).unwrap();
-                let fields = war.extract(self.tree);
-                self.resolve_variable_declaration(index, fields.name, fields.typ, fields.value);
+                let data = war.extract(self.tree);
+                self.resolve_variable_declaration(
+                    ReferenceNode::Var(war),
+                    data.name,
+                    data.typ,
+                    data.value,
+                );
             },
             parse::Tag::StmtLet => {
                 let lett = syntax::StmtLet::new(syntax::SyntaxNode::new(node, index)).unwrap();
-                let fields = lett.extract(self.tree);
-                self.resolve_variable_declaration(index, fields.name, fields.typ, fields.value);
+                let data = lett.extract(self.tree);
+                self.resolve_variable_declaration(
+                    ReferenceNode::Let(lett),
+                    data.name,
+                    data.typ,
+                    data.value,
+                );
+            },
+
+            parse::Tag::DeclStructField => {
+                let field =
+                    syntax::DeclStructField::new(syntax::SyntaxNode::new(node, index)).unwrap();
+                let data = field.extract(self.tree);
+                self.resolve_references_maybe(data.attributes);
+                if let Some(name) = data.name {
+                    self.references
+                        .insert(name.index(), Reference::Node(ReferenceNode::StructField(field)));
+                }
+                self.resolve_references_maybe(data.typ);
             },
 
             parse::Tag::DeclFnParameter => {
                 let param =
                     syntax::DeclFnParameter::new(syntax::SyntaxNode::new(node, index)).unwrap();
-                let fields = param.extract(self.tree);
-                self.resolve_variable_declaration(index, fields.name, fields.typ, None);
+                let data = param.extract(self.tree);
+                self.resolve_variable_declaration(
+                    ReferenceNode::FnParameter(param),
+                    data.name,
+                    data.typ,
+                    None,
+                );
             },
 
             tag => {
@@ -273,15 +380,15 @@ impl<'a> Context<'a> {
 
     fn resolve_variable_declaration(
         &mut self,
-        index: parse::NodeIndex,
+        node: ReferenceNode,
         name: Option<syntax::Token!(Identifier)>,
         typ: Option<syntax::TypeSpecifier>,
         value: Option<syntax::Expression>,
     ) {
         if let Some(name) = name {
             let text = &self.source[name.byte_range()];
-            self.scope.insert(text, index);
-            self.references.insert(name.index(), Reference::Node(index));
+            self.scope.insert(text, node);
+            self.references.insert(name.index(), Reference::Node(node));
         }
         self.resolve_references_maybe(typ);
         self.resolve_references_maybe(value);
@@ -305,7 +412,7 @@ struct ScopeId(u32);
 
 struct ScopeSymbol {
     /// Which node this symbol refers to.
-    node: parse::NodeIndex,
+    node: ReferenceNode,
     /// In which scope this symbol is valid.
     scope: ScopeId,
     /// Points to a shadowed symbol of the same name.
@@ -335,7 +442,7 @@ impl<'a> Scope<'a> {
         self.active_scopes.pop();
     }
 
-    pub fn insert(&mut self, name: &'a str, node: parse::NodeIndex) {
+    pub fn insert(&mut self, name: &'a str, node: ReferenceNode) {
         let new = ScopeSymbol { node, scope: *self.active_scopes.last().unwrap(), shadowed: None };
         match self.symbols.entry(name) {
             std::collections::hash_map::Entry::Occupied(mut entry) => {
@@ -348,7 +455,7 @@ impl<'a> Scope<'a> {
         }
     }
 
-    pub fn get(&mut self, name: &'a str) -> Option<parse::NodeIndex> {
+    pub fn get(&mut self, name: &'a str) -> Option<ReferenceNode> {
         use std::collections::hash_map::Entry;
         let Entry::Occupied(mut entry) = self.symbols.entry(name) else { return None };
 
@@ -361,7 +468,7 @@ impl<'a> Scope<'a> {
         }
     }
 
-    fn get_slot(slot: &mut ScopeSymbol, active_scopes: &[ScopeId]) -> Option<parse::NodeIndex> {
+    fn get_slot(slot: &mut ScopeSymbol, active_scopes: &[ScopeId]) -> Option<ReferenceNode> {
         loop {
             if Self::is_active(slot.scope, active_scopes) {
                 return Some(slot.node);
@@ -378,7 +485,7 @@ impl<'a> Scope<'a> {
         }
     }
 
-    fn iter_symbols(&mut self) -> impl Iterator<Item = (&'a str, parse::NodeIndex)> + '_ {
+    fn iter_symbols(&mut self) -> impl Iterator<Item = (&'a str, ReferenceNode)> + '_ {
         self.symbols.iter_mut().filter_map(|(name, slot)| {
             let node = Self::get_slot(slot, &self.active_scopes)?;
             Some((*name, node))
@@ -394,25 +501,18 @@ pub struct ResolvedSymbol {
 
 #[derive(Debug)]
 pub enum ResolvedSymbolKind {
-    User(parse::NodeIndex),
+    User(ReferenceNode),
     BuiltinFunction(&'static wgsl_spec::Function),
+    BuiltinTypeAlias(&'static String, &'static String),
 }
 
 impl ResolvedSymbolKind {
     pub fn name(&self, tree: &parse::Tree) -> Option<syntax::Token!(Identifier)> {
         match self {
-            &ResolvedSymbolKind::User(index) => {
-                if let Some(decl) = syntax::Decl::from_tree(tree, index) {
-                    return decl.name(tree);
-                }
-
-                if let Some(lett) = syntax::StmtLet::from_tree(tree, index) {
-                    return lett.extract(tree).name;
-                }
-
+            &ResolvedSymbolKind::User(node) => node.name(tree),
+            ResolvedSymbolKind::BuiltinFunction(_) | ResolvedSymbolKind::BuiltinTypeAlias(_, _) => {
                 None
             },
-            ResolvedSymbolKind::BuiltinFunction(_) => None,
         }
     }
 }

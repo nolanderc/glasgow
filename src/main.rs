@@ -152,20 +152,42 @@ fn add_routes(router: &mut Router) {
         let mut completions = Vec::with_capacity(symbols.len());
 
         for symbol in symbols {
-            let mut item = lsp::CompletionItem { label: symbol.name, ..Default::default() };
+            let mut item = lsp::CompletionItem {
+                label: symbol.name,
+                documentation: Some(lsp::Documentation::MarkupContent(symbol_documentation(
+                    document,
+                    &symbol.kind,
+                )?)),
+                ..Default::default()
+            };
 
             match &symbol.kind {
-                analyze::ResolvedSymbolKind::User(_) => {
-                    item.documentation = Some(lsp::Documentation::MarkupContent(
-                        symbol_documentation(document, &symbol.kind)?,
-                    ));
+                analyze::ResolvedSymbolKind::User(node) => {
+                    item.kind = match node {
+                        analyze::ReferenceNode::Alias(_) => Some(lsp::CompletionItemKind::CLASS),
+                        analyze::ReferenceNode::Struct(_) => Some(lsp::CompletionItemKind::STRUCT),
+                        analyze::ReferenceNode::StructField(_) => {
+                            Some(lsp::CompletionItemKind::FIELD)
+                        },
+
+                        analyze::ReferenceNode::Fn(_) => Some(lsp::CompletionItemKind::FUNCTION),
+
+                        analyze::ReferenceNode::Const(_) | analyze::ReferenceNode::Override(_) => {
+                            Some(lsp::CompletionItemKind::CONSTANT)
+                        },
+
+                        analyze::ReferenceNode::Var(_)
+                        | analyze::ReferenceNode::FnParameter(_)
+                        | analyze::ReferenceNode::Let(_) => Some(lsp::CompletionItemKind::VARIABLE),
+                    };
                 },
 
                 analyze::ResolvedSymbolKind::BuiltinFunction(_function) => {
                     item.kind = Some(CompletionItemKind::FUNCTION);
-                    item.documentation = Some(lsp::Documentation::MarkupContent(
-                        symbol_documentation(document, &symbol.kind)?,
-                    ));
+                },
+
+                analyze::ResolvedSymbolKind::BuiltinTypeAlias(_, _) => {
+                    item.kind = Some(CompletionItemKind::CLASS);
                 },
             }
 
@@ -181,7 +203,9 @@ fn add_routes(router: &mut Router) {
         let offset = document
             .offset_utf8_from_position_utf16(location.position)
             .context("invalid position")?;
-        let Some((symbol, _token)) = document.symbol_at_offset(offset) else { return Ok(None) };
+        let Some((symbol, _token)) = document.symbol_at_offset(offset) else {
+            return Ok(None);
+        };
 
         let Some(name) = symbol.kind.name(&document.parse().tree) else { return Ok(None) };
         let range = name.byte_range();
@@ -279,19 +303,37 @@ fn symbol_documentation(
     match symbol {
         &analyze::ResolvedSymbolKind::User(node) => {
             let tree = &document.parse().tree;
-            if let Some(decl) = syntax::Decl::from_tree(tree, node) {
-                if let Some(name) = decl.name(tree) {
-                    let text = &document.content()[name.byte_range()];
-                    writeln!(markdown, "`{text}`")?;
-                }
-            }
 
-            if let Some(lett) = syntax::StmtLet::from_tree(tree, node) {
-                let fields = lett.extract(tree);
-                if let Some(name) = fields.name {
-                    let text = &document.content()[name.byte_range()];
-                    writeln!(markdown, "`{text}`")?;
+            let snippet_range = match node {
+                analyze::ReferenceNode::Fn(func) => {
+                    let data = func.extract(tree);
+                    let mut children = func.parse_node().children();
+
+                    if data.body.is_some() {
+                        // discard from snippet
+                        _ = children.next_back();
+                    }
+
+                    tree.byte_range_total_children(children)
+                },
+                analyze::ReferenceNode::Alias(x) => tree.byte_range_total(x.index()),
+                analyze::ReferenceNode::Struct(x) => tree.byte_range_total(x.index()),
+                analyze::ReferenceNode::StructField(x) => tree.byte_range_total(x.index()),
+                analyze::ReferenceNode::Const(x) => tree.byte_range_total(x.index()),
+                analyze::ReferenceNode::Override(x) => tree.byte_range_total(x.index()),
+                analyze::ReferenceNode::Var(x) => tree.byte_range_total(x.index()),
+                analyze::ReferenceNode::FnParameter(x) => tree.byte_range_total(x.index()),
+                analyze::ReferenceNode::Let(x) => tree.byte_range_total(x.index()),
+            };
+
+            if let Some(range) = snippet_range {
+                let text = &document.content()[range];
+                writeln!(markdown, "```wgsl")?;
+                for line in text.trim().lines() {
+                    writeln!(markdown, "{line}")?;
                 }
+                writeln!(markdown, "```")?;
+                writeln!(markdown)?;
             }
         },
 
@@ -339,10 +381,18 @@ fn symbol_documentation(
                     }
                 }
 
-                writeln!(markdown, "{}", overload.signature)?;
+                for line in overload.signature.trim().lines() {
+                    writeln!(markdown, "{line}")?;
+                }
                 writeln!(markdown, "```")?;
                 writeln!(markdown)?;
             }
+        },
+
+        analyze::ResolvedSymbolKind::BuiltinTypeAlias(name, original) => {
+            writeln!(markdown, "```wgsl")?;
+            writeln!(markdown, "alias {name} = {original};")?;
+            writeln!(markdown, "```")?;
         },
     }
 

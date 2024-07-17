@@ -215,7 +215,7 @@ impl Document {
                 let text = &self.content[name.byte_range()];
                 let symbol = crate::analyze::ResolvedSymbol {
                     name: text.into(),
-                    kind: crate::analyze::ResolvedSymbolKind::User(decl.index()),
+                    kind: crate::analyze::ResolvedSymbolKind::User(decl.into()),
                 };
                 return Some((symbol, token));
             }

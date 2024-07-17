@@ -11,7 +11,18 @@ impl SyntaxNode {
         Self { parse, index }
     }
 
-    pub fn children(self, tree: &Tree) -> impl Iterator<Item = SyntaxNode> + '_ {
+    pub fn parse_node(self) -> parse::Node {
+        self.parse
+    }
+
+    pub fn index(self) -> parse::NodeIndex {
+        self.index
+    }
+
+    pub fn children(
+        self,
+        tree: &Tree,
+    ) -> impl ExactSizeIterator<Item = SyntaxNode> + DoubleEndedIterator + '_ {
         tree.children(self.parse)
             .iter()
             .zip(self.parse.children())
@@ -62,6 +73,7 @@ macro_rules! syntax_node_simple {
         syntax_node_simple!($name);
 
         #[allow(dead_code)]
+        #[derive(Debug)]
         pub struct $extracted {
             $( pub $field: Option<$fieldty> ),*
         }
@@ -83,17 +95,14 @@ fn try_extract<T: SyntaxNodeMatch>(
 ) -> Option<T> {
     loop {
         let node = *nodes.peek()?;
-
-        if let Some(x) = T::new(node) {
-            nodes.next();
-            return Some(x);
-        }
-
         if matches!(node.parse.tag(), parse::Tag::InvalidToken | parse::Tag::InvalidSyntax) {
             nodes.next();
-        } else {
-            return None;
+            continue;
         }
+
+        let x = T::new(node)?;
+        nodes.next();
+        return Some(x);
     }
 }
 
@@ -195,7 +204,7 @@ impl Decl {
 
 syntax_node_simple!(
     DeclAlias,
-    struct DeclAliasFields {
+    struct DeclAliasData {
         attributes: AttributeList,
         alias_token: Token!(KeywordAlias),
         name: Token!(Identifier),
@@ -207,18 +216,27 @@ syntax_node_simple!(
 
 syntax_node_simple!(
     DeclStruct,
-    struct DeclStructFields {
+    struct DeclStructData {
         attributes: AttributeList,
-        struct_token: Token!(KeywordAlias),
+        struct_token: Token!(KeywordStruct),
         name: Token!(Identifier),
         fields: DeclStructFieldList,
     }
 );
 syntax_node_simple!(DeclStructFieldList);
+syntax_node_simple!(
+    DeclStructField,
+    struct DeclStructFieldData {
+        attributes: AttributeList,
+        name: Token!(Identifier),
+        colon_token: Token!(Colon),
+        typ: TypeSpecifier,
+    }
+);
 
 syntax_node_simple!(
     DeclConst,
-    struct DeclConstFields {
+    struct DeclConstData {
         const_token: Token!(KeywordConst),
         name: Token!(Identifier),
         colon_token: Token!(Colon),
@@ -231,7 +249,7 @@ syntax_node_simple!(
 
 syntax_node_simple!(
     DeclOverride,
-    struct DeclOverrideFields {
+    struct DeclOverrideData {
         attributes: AttributeList,
         override_token: Token!(KeywordOverride),
         name: Token!(Identifier),
@@ -245,7 +263,7 @@ syntax_node_simple!(
 
 syntax_node_simple!(
     DeclVar,
-    struct DeclVarFields {
+    struct DeclVarData {
         attributes: AttributeList,
         var_token: Token!(KeywordVar),
         template: TemplateList,
@@ -260,7 +278,7 @@ syntax_node_simple!(
 
 syntax_node_simple!(
     DeclFn,
-    struct DeclFnFields {
+    struct DeclFnData {
         attributes: AttributeList,
         fn_token: Token!(KeywordFn),
         name: Token!(Identifier),
@@ -272,7 +290,7 @@ syntax_node_simple!(
 syntax_node_simple!(DeclFnParameterList);
 syntax_node_simple!(
     DeclFnParameter,
-    struct DeclFnParameterFields {
+    struct DeclFnParameterData {
         attributes: AttributeList,
         name: Token!(Identifier),
         colon_token: Token!(Colon),
@@ -285,7 +303,7 @@ syntax_node_simple!(StmtBlock);
 
 syntax_node_simple!(
     StmtLet,
-    struct StmtLetFields {
+    struct StmtLetData {
         let_token: Token!(KeywordLet),
         name: Token!(Identifier),
         colon_token: Token!(Colon),
@@ -300,10 +318,25 @@ syntax_node_enum!(
     enum Expression {
         Identifier(Token!(Identifier)),
         IdentifierWithTemplate(IdentifierWithTemplate),
+        IntegerDecimal(Token!(IntegerDecimal)),
+        IntegerHex(Token!(IntegerHex)),
+        FloatDecimal(Token!(FloatDecimal)),
+        FloatHex(Token!(FloatHex)),
+        True(Token!(KeywordTrue)),
+        False(Token!(KeywordFalse)),
+        Call(ExprCall),
+        Parens(ExprParens),
+        Index(ExprIndex),
+        Member(ExprMember),
     }
 );
 
+syntax_node_simple!(ExprCall);
 syntax_node_simple!(ArgumentList);
+
+syntax_node_simple!(ExprParens);
+syntax_node_simple!(ExprIndex);
+syntax_node_simple!(ExprMember);
 
 syntax_node_enum!(
     enum TypeSpecifier {
@@ -319,7 +352,7 @@ syntax_node_simple!(AttributeList);
 
 syntax_node_simple!(
     Attribute,
-    struct AttributeFields {
+    struct AttributeData {
         at_token: Token!(AtSign),
         name: Token!(Identifier),
         arguments: ArgumentList,

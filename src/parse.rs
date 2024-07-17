@@ -397,6 +397,38 @@ impl Tree {
         self.node(self.root_index())
     }
 
+    #[inline]
+    pub fn byte_range_total(&self, index: NodeIndex) -> Option<std::ops::Range<usize>> {
+        let node = self.node(index);
+        if node.is_token() {
+            return Some(node.byte_range());
+        }
+        self.byte_range_total_children(node.children())
+    }
+
+    pub fn byte_range_total_children(
+        &self,
+        mut children: impl DoubleEndedIterator<Item = NodeIndex>,
+    ) -> Option<std::ops::Range<usize>> {
+        let min = loop {
+            let child = children.next()?;
+            match self.byte_range_total(child) {
+                Some(range) => break range,
+                None => continue,
+            }
+        };
+
+        let max = loop {
+            let Some(child) = children.next_back() else { break min.clone() };
+            match self.byte_range_total(child) {
+                Some(range) => break range,
+                None => continue,
+            }
+        };
+
+        Some(min.start..max.end)
+    }
+
     #[cfg(test)]
     pub fn traverse_pre_order<E>(
         &self,
