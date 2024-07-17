@@ -1,5 +1,5 @@
 use std::{
-    cell::{Cell, RefCell},
+    cell::RefCell,
     collections::{BTreeMap, HashMap},
     num::NonZeroU32,
     rc::Rc,
@@ -87,7 +87,7 @@ pub struct Context<'a> {
     references: RefCell<HashMap<parse::NodeIndex, Reference>>,
 
     /// The inferred type for each syntax node.
-    types: Cell<HashMap<parse::NodeIndex, Option<Type>>>,
+    types: RefCell<HashMap<parse::NodeIndex, Option<Type>>>,
 
     /// If set, we should record a capture of the visible symbols during name resolution.
     /// At which node we should perform the capture.
@@ -106,14 +106,14 @@ pub enum Reference {
     User(ReferenceNode),
     BuiltinFunction(&'static wgsl_spec::Function),
     BuiltinTypeAlias(&'static String, &'static String),
-    Type(Type),
+    BuiltinType(Type),
 }
 
 impl Reference {
     pub fn name(&self, tree: &parse::Tree) -> Option<syntax::Token!(Identifier)> {
         match self {
             &Reference::User(node) => node.name(tree),
-            Reference::Type(typ) => match typ {
+            Reference::BuiltinType(typ) => match typ {
                 Type::Struct(strukt) => strukt.extract(tree).name,
                 Type::Fn(func) => func.extract(tree).name,
                 _ => None,
@@ -195,7 +195,7 @@ pub struct ErrorUnresolvedReference {
 
 impl<'a> Context<'a> {
     pub fn new(global_scope: &'a GlobalScope, tree: &'a parse::Tree, source: &'a str) -> Self {
-        Self {
+        let mut context = Self {
             builtin_functions: get_builtin_functions(),
             builtin_tokens: get_builtin_tokens(),
 
@@ -209,21 +209,58 @@ impl<'a> Context<'a> {
 
             capture_node: None,
             capture: Default::default(),
+        };
+
+        context.analyze_signatures_all();
+
+        context
+    }
+
+    pub fn analyze_signatures_all(&mut self) {
+        for decl in syntax::root(self.tree).decls(self.tree) {
+            self.analyze_signature(decl);
+            self.scope.reset();
         }
     }
 
-    pub(crate) fn reset(&mut self) {
-        self.scope.reset();
-        self.references = Default::default();
-        self.capture = Default::default();
-        self.errors.get_mut().clear();
+    pub fn analyze_signature(&mut self, decl: syntax::Decl) {
+        match decl {
+            // the bodies of functions may be quite large, and a return type is optional, so we
+            // skip resolving references in other decls bodies if not necessary.
+            syntax::Decl::Fn(func) => {
+                let data = func.extract(self.tree);
+                let mut children = func.parse_node().children();
+                if data.body.is_some() {
+                    // remove the body
+                    children.next_back();
+                }
+
+                for child in children {
+                    let scope_func = self.scope.begin();
+                    self.resolve_references(child);
+                    self.scope.end(scope_func);
+                }
+            },
+
+            // for these decls, we may have to infer the type of their fields/values, so ensure we
+            // have resolved all references.
+            syntax::Decl::Alias(_)
+            | syntax::Decl::Struct(_)
+            | syntax::Decl::Const(_)
+            | syntax::Decl::Override(_)
+            | syntax::Decl::Var(_) => {
+                let scope_top_level = self.scope.begin();
+                self.resolve_references(decl.index());
+                self.scope.end(scope_top_level);
+            },
+        }
     }
 
     pub fn analyze_decl(&mut self, decl: syntax::Decl) -> &mut Vec<Error> {
         // name resolution:
-        let scope_root = self.scope.begin();
+        let scope_top_level = self.scope.begin();
         self.resolve_references(decl.index());
-        self.scope.end(scope_root);
+        self.scope.end(scope_top_level);
 
         match decl {
             syntax::Decl::Alias(_) => {},
@@ -253,7 +290,7 @@ impl<'a> Context<'a> {
 
     pub fn get_node_symbol(&self, node: parse::NodeIndex) -> Option<ResolvedSymbol> {
         let reference = self.references.borrow().get(&node)?.clone();
-        let typ = self.type_of_reference(&reference).or_else(|| self.get_inferred_type(node));
+        let typ = self.get_inferred_type(node).or_else(|| self.type_of_reference(&reference));
         Some(ResolvedSymbol {
             name: self.source[self.tree.node(node).byte_range()].into(),
             reference,
@@ -303,14 +340,14 @@ impl<'a> Context<'a> {
             let Some(typ) = self.parse_type_specifier(name) else {
                 unreachable!("could parse primitive type: {name}")
             };
-            references.push((name, Reference::Type(typ)));
+            references.push((name, Reference::BuiltinType(typ)));
         }
 
         for name in self.builtin_tokens.type_generators.iter() {
             let Some(typ) = self.parse_type_specifier(name) else {
                 unreachable!("could parse type generator: {name}")
             };
-            references.push((name, Reference::Type(typ)));
+            references.push((name, Reference::BuiltinType(typ)));
         }
 
         CaptureSymbols { references }
@@ -501,25 +538,21 @@ impl<'a> Context<'a> {
     }
 
     fn infer_type_expr(&self, expr: syntax::Expression) -> Option<Type> {
-        let mut cache = self.types.take();
-
-        let typ = match cache.entry(expr.index()) {
-            std::collections::hash_map::Entry::Occupied(entry) => entry.get().as_ref().cloned(),
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(self.infer_type_expr_uncached(expr)).as_ref().cloned()
-            },
-        };
-
-        self.types.set(cache);
-
+        let index = expr.index();
+        if let Some(old) = self.types.borrow().get(&index) {
+            return old.clone();
+        }
+        let typ = self.infer_type_expr_uncached(expr);
+        self.types.borrow_mut().insert(index, typ.clone());
         typ
     }
 
     fn get_inferred_type(&self, node: parse::NodeIndex) -> Option<Type> {
-        let cache = self.types.take();
-        let typ = cache.get(&node).cloned().flatten();
-        self.types.set(cache);
-        typ
+        self.types.borrow().get(&node)?.clone()
+    }
+
+    fn set_inferred_type(&self, node: parse::NodeIndex, typ: Option<Type>) {
+        self.types.borrow_mut().insert(node, typ);
     }
 
     fn infer_type_expr_maybe(&self, expr: Option<syntax::Expression>) -> Option<Type> {
@@ -649,11 +682,15 @@ impl<'a> Context<'a> {
                                 .push(Error::InvalidMember(expr_member, target_type));
                         }
 
-                        if count == 1 {
+                        let typ = if count == 1 {
                             scalar.map(Type::Scalar)
                         } else {
                             Some(Type::Vec(count, scalar))
-                        }
+                        };
+
+                        self.set_inferred_type(member.index(), typ.clone());
+
+                        typ
                     },
                     Type::Struct(strukt) => {
                         let data = strukt.extract(self.tree);
@@ -668,7 +705,11 @@ impl<'a> Context<'a> {
                                         member.index(),
                                         Reference::User(ReferenceNode::StructField(field)),
                                     );
-                                    return self.type_from_specifier(spec, self.tree, self.source);
+                                    let typ = self
+                                        .type_from_specifier(spec, self.tree, self.source)
+                                        .map(Type::unwrap_inner);
+                                    self.set_inferred_type(member.index(), typ.clone());
+                                    return typ;
                                 }
                             }
                         }
@@ -728,7 +769,7 @@ impl<'a> Context<'a> {
             },
             Reference::BuiltinFunction(_) => None,
             Reference::BuiltinTypeAlias(_, original) => self.parse_type_specifier(original),
-            Reference::Type(typ) => Some(Type::Type(Rc::new(typ.clone()))),
+            Reference::BuiltinType(typ) => Some(Type::Type(Rc::new(typ.clone()))),
         }
     }
 
@@ -738,7 +779,7 @@ impl<'a> Context<'a> {
         value: Option<syntax::Expression>,
     ) -> Option<Type> {
         if let Some(spec) = spec {
-            self.type_from_specifier(spec, self.tree, self.source)
+            self.type_from_specifier(spec, self.tree, self.source).map(Type::unwrap_inner)
         } else {
             self.infer_type_expr(value?)
         }
@@ -773,6 +814,7 @@ impl<'a> Context<'a> {
 
         let name = &source[identifier.byte_range()];
 
+        // vvvvvvvvvvvvv HELPER FUNCTIONS vvvvvvvvvvvvv //
         let type_inner = |context: &Self, parameter: Option<syntax::Expression>| {
             let spec = match parameter? {
                 syntax::Expression::Identifier(x) => syntax::TypeSpecifier::Identifier(x),
@@ -781,16 +823,14 @@ impl<'a> Context<'a> {
                 },
                 _ => return None,
             };
-            context.type_from_specifier(spec, tree, source)
+            context.type_from_specifier(spec, tree, source).map(Type::unwrap_inner)
         };
-
         let scalar = |context: &Self, parameter: Option<syntax::Expression>| match type_inner(
             context, parameter,
         ) {
             Some(Type::Scalar(scalar)) => Some(scalar),
             _ => None,
         };
-
         let integer = |_: &Self, parameter: Option<syntax::Expression>| match parameter? {
             syntax::Expression::IntegerDecimal(integer) => source[integer.byte_range()]
                 .trim_end_matches(|x| x == 'i' || x == 'u')
@@ -805,110 +845,107 @@ impl<'a> Context<'a> {
             },
             _ => None,
         };
-
         let address_space = |_: &Self, parameter: Option<syntax::Expression>| match parameter? {
             syntax::Expression::Identifier(name) => {
                 AddressSpace::from_str(&source[name.byte_range()])
             },
             _ => None,
         };
-
         let format = |_: &Self, parameter: Option<syntax::Expression>| match parameter? {
             syntax::Expression::Identifier(name) => {
                 TextureFormat::from_str(&source[name.byte_range()])
             },
             _ => None,
         };
-
         let access = |_: &Self, parameter: Option<syntax::Expression>| match parameter? {
             syntax::Expression::Identifier(name) => {
                 AccessMode::from_str(&source[name.byte_range()])
             },
             _ => None,
         };
+        // ^^^^^^^^^^^^^ HELPER FUNCTIONS ^^^^^^^^^^^^^ //
 
-        if let Some(reference) = self.references.borrow().get(&identifier.index()) {
-            if let Some(typ) = self.type_of_reference(reference) {
-                return Some(typ);
+        if std::ptr::eq(self.tree, tree) {
+            if let Some(reference) = self.references.borrow().get(&identifier.index()) {
+                if let Some(typ) = self.type_of_reference(reference) {
+                    return Some(typ);
+                }
             }
         }
 
-        match name {
-            "i32" => Some(Type::Scalar(TypeScalar::I32)),
-            "u32" => Some(Type::Scalar(TypeScalar::U32)),
-            "f32" => Some(Type::Scalar(TypeScalar::F32)),
-            "f16" => Some(Type::Scalar(TypeScalar::F16)),
+        let typ = match name {
+            "i32" => Type::Scalar(TypeScalar::I32),
+            "u32" => Type::Scalar(TypeScalar::U32),
+            "f32" => Type::Scalar(TypeScalar::F32),
+            "f16" => Type::Scalar(TypeScalar::F16),
 
-            "bool" => Some(Type::Scalar(TypeScalar::Bool)),
+            "bool" => Type::Scalar(TypeScalar::Bool),
 
-            "vec2" => Some(Type::Vec(2, scalar(self, params.next()))),
-            "vec3" => Some(Type::Vec(3, scalar(self, params.next()))),
-            "vec4" => Some(Type::Vec(4, scalar(self, params.next()))),
+            "vec2" => Type::Vec(2, scalar(self, params.next())),
+            "vec3" => Type::Vec(3, scalar(self, params.next())),
+            "vec4" => Type::Vec(4, scalar(self, params.next())),
 
-            "mat2x2" => Some(Type::Mat(2, 2, scalar(self, params.next()))),
-            "mat2x3" => Some(Type::Mat(2, 3, scalar(self, params.next()))),
-            "mat2x4" => Some(Type::Mat(2, 4, scalar(self, params.next()))),
+            "mat2x2" => Type::Mat(2, 2, scalar(self, params.next())),
+            "mat2x3" => Type::Mat(2, 3, scalar(self, params.next())),
+            "mat2x4" => Type::Mat(2, 4, scalar(self, params.next())),
 
-            "mat3x2" => Some(Type::Mat(3, 2, scalar(self, params.next()))),
-            "mat3x3" => Some(Type::Mat(3, 3, scalar(self, params.next()))),
-            "mat3x4" => Some(Type::Mat(3, 4, scalar(self, params.next()))),
+            "mat3x2" => Type::Mat(3, 2, scalar(self, params.next())),
+            "mat3x3" => Type::Mat(3, 3, scalar(self, params.next())),
+            "mat3x4" => Type::Mat(3, 4, scalar(self, params.next())),
 
-            "mat4x2" => Some(Type::Mat(4, 2, scalar(self, params.next()))),
-            "mat4x3" => Some(Type::Mat(4, 3, scalar(self, params.next()))),
-            "mat4x4" => Some(Type::Mat(4, 4, scalar(self, params.next()))),
+            "mat4x2" => Type::Mat(4, 2, scalar(self, params.next())),
+            "mat4x3" => Type::Mat(4, 3, scalar(self, params.next())),
+            "mat4x4" => Type::Mat(4, 4, scalar(self, params.next())),
 
-            "ptr" => Some(Type::Ptr(
+            "ptr" => Type::Ptr(
                 address_space(self, params.next()),
                 type_inner(self, params.next()).map(Rc::new),
                 access(self, params.next()),
-            )),
+            ),
 
-            "array" => Some(Type::Array(
+            "array" => Type::Array(
                 type_inner(self, params.next()).map(Rc::new),
                 integer(self, params.next()).and_then(NonZeroU32::new),
-            )),
+            ),
 
-            "atomic" => Some(Type::Atomic(scalar(self, params.next()))),
+            "atomic" => Type::Atomic(scalar(self, params.next())),
 
-            "sampler" => Some(Type::Sampler),
-            "sampler_comparison" => Some(Type::SamplerComparison),
-            "texture_depth_2d" => Some(Type::TextureDepth2d),
-            "texture_depth_2d_array" => Some(Type::TextureDepth2dArray),
-            "texture_depth_cube" => Some(Type::TextureDepthCube),
-            "texture_depth_cube_array" => Some(Type::TextureDepthCubeArray),
-            "texture_depth_multisampled_2d" => Some(Type::TextureDepthMultisampled2d),
-            "texture_external" => Some(Type::TextureExternal),
+            "sampler" => Type::Sampler,
+            "sampler_comparison" => Type::SamplerComparison,
+            "texture_depth_2d" => Type::TextureDepth2d,
+            "texture_depth_2d_array" => Type::TextureDepth2dArray,
+            "texture_depth_cube" => Type::TextureDepthCube,
+            "texture_depth_cube_array" => Type::TextureDepthCubeArray,
+            "texture_depth_multisampled_2d" => Type::TextureDepthMultisampled2d,
+            "texture_external" => Type::TextureExternal,
 
-            "texture_1d" => Some(Type::Texture1d(scalar(self, params.next()))),
-            "texture_2d" => Some(Type::Texture2d(scalar(self, params.next()))),
-            "texture_2d_array" => Some(Type::Texture2dArray(scalar(self, params.next()))),
-            "texture_3d" => Some(Type::Texture3d(scalar(self, params.next()))),
-            "texture_cube" => Some(Type::TextureCube(scalar(self, params.next()))),
-            "texture_cube_array" => Some(Type::TextureCubeArray(scalar(self, params.next()))),
-            "texture_multisampled_2d" => {
-                Some(Type::TextureMultisampled2d(scalar(self, params.next())))
+            "texture_1d" => Type::Texture1d(scalar(self, params.next())),
+            "texture_2d" => Type::Texture2d(scalar(self, params.next())),
+            "texture_2d_array" => Type::Texture2dArray(scalar(self, params.next())),
+            "texture_3d" => Type::Texture3d(scalar(self, params.next())),
+            "texture_cube" => Type::TextureCube(scalar(self, params.next())),
+            "texture_cube_array" => Type::TextureCubeArray(scalar(self, params.next())),
+            "texture_multisampled_2d" => Type::TextureMultisampled2d(scalar(self, params.next())),
+
+            "texture_storage_1d" => {
+                Type::TextureStorage1d(format(self, params.next()), access(self, params.next()))
+            },
+            "texture_storage_2d" => {
+                Type::TextureStorage2d(format(self, params.next()), access(self, params.next()))
+            },
+            "texture_storage_2d_array" => Type::TextureStorage2dArray(
+                format(self, params.next()),
+                access(self, params.next()),
+            ),
+            "texture_storage_3d" => {
+                Type::TextureStorage3d(format(self, params.next()), access(self, params.next()))
             },
 
-            "texture_storage_1d" => Some(Type::TextureStorage1d(
-                format(self, params.next()),
-                access(self, params.next()),
-            )),
-            "texture_storage_2d" => Some(Type::TextureStorage2d(
-                format(self, params.next()),
-                access(self, params.next()),
-            )),
-            "texture_storage_2d_array" => Some(Type::TextureStorage2dArray(
-                format(self, params.next()),
-                access(self, params.next()),
-            )),
-            "texture_storage_3d" => Some(Type::TextureStorage3d(
-                format(self, params.next()),
-                access(self, params.next()),
-            )),
-
             // TODO: add samplers, textures, etc.
-            _ => None,
-        }
+            _ => return None,
+        };
+
+        Some(Type::Type(Rc::new(typ)))
     }
 }
 
@@ -1015,6 +1052,7 @@ pub struct ResolvedSymbol {
 pub enum Type {
     /// The type of a specific type. For example, `u32` in source code would have the type
     /// `Type(u32)`, while the number `123u` would have the actual type `u32`.
+    #[allow(clippy::enum_variant_names)]
     Type(Rc<Type>),
 
     Scalar(TypeScalar),
@@ -1051,6 +1089,13 @@ pub enum Type {
 }
 
 impl Type {
+    pub fn unwrap_inner(self) -> Type {
+        match self {
+            Type::Type(inner) => Type::clone(&inner),
+            _ => self,
+        }
+    }
+
     pub fn fmt<F: std::fmt::Write>(
         &self,
         f: &mut F,

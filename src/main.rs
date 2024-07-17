@@ -130,7 +130,7 @@ fn add_routes(router: &mut Router) {
 
         let parsed = document.parse();
         let range = parsed.tree.node(token).byte_range();
-        let documentation = symbol_documentation(document, &symbol.reference)?;
+        let documentation = symbol_documentation(document, &symbol)?;
 
         Ok(Some(lsp::Hover {
             range: document.range_utf16_from_range_utf8(range),
@@ -152,12 +152,10 @@ fn add_routes(router: &mut Router) {
         let mut completions = Vec::with_capacity(symbols.len());
 
         for symbol in symbols {
+            let documentation = symbol_documentation(document, &symbol)?;
             let mut item = lsp::CompletionItem {
                 label: symbol.name,
-                documentation: Some(lsp::Documentation::MarkupContent(symbol_documentation(
-                    document,
-                    &symbol.reference,
-                )?)),
+                documentation: Some(lsp::Documentation::MarkupContent(documentation)),
                 ..Default::default()
             };
 
@@ -179,7 +177,7 @@ fn add_routes(router: &mut Router) {
                 },
                 analyze::Reference::BuiltinFunction(_) => CompletionItemKind::FUNCTION,
                 analyze::Reference::BuiltinTypeAlias(_, _) => CompletionItemKind::CLASS,
-                analyze::Reference::Type(_) => CompletionItemKind::CLASS,
+                analyze::Reference::BuiltinType(_) => CompletionItemKind::CLASS,
             });
 
             completions.push(item);
@@ -337,13 +335,19 @@ fn collect_diagnostics(state: &State, uri: &lsp::Uri) -> Result<Vec<lsp::Diagnos
 
 fn symbol_documentation(
     document: &workspace::Document,
-    reference: &analyze::Reference,
+    symbol: &analyze::ResolvedSymbol,
 ) -> Result<lsp::MarkupContent> {
     use std::fmt::Write;
 
     let mut markdown = String::new();
 
-    match reference {
+    if let Some(typ) = &symbol.typ {
+        writeln!(markdown, "```wgsl")?;
+        writeln!(markdown, ": {}", document.format_type(typ))?;
+        writeln!(markdown, "```")?;
+    }
+
+    match &symbol.reference {
         &analyze::Reference::User(node) => {
             let tree = &document.parse().tree;
 
@@ -438,7 +442,7 @@ fn symbol_documentation(
             writeln!(markdown, "```")?;
         },
 
-        analyze::Reference::Type(typ) => {
+        analyze::Reference::BuiltinType(typ) => {
             let parsed = document.parse();
             writeln!(markdown, "```wgsl")?;
             typ.fmt(&mut markdown, &parsed.tree, document.content())?;
@@ -765,45 +769,110 @@ mod tests {
         expected.assert_eq(&found);
     }
 
-    #[test]
-    fn hover() {
+    fn check_hover(source: &str, expected: expect_test::Expect) {
         let client = Client::new();
 
-        let (source, cursors) = document_with_cursors(indoc::indoc! {r#"
-            fn main() {
-                $dot(vec3(1.0), vec3(1, 2, 3));
-            }
-        "#});
-
+        let (source, cursors) = document_with_cursors(source);
         let uri = client.open_document(&source);
 
-        let hover_info = client.request::<lsp::request::HoverRequest>(lsp::HoverParams {
-            text_document_position_params: lsp::TextDocumentPositionParams {
-                text_document: lsp::TextDocumentIdentifier::new(uri.clone()),
-                position: cursors[0],
-            },
-            work_done_progress_params: Default::default(),
-        });
+        let mut hovers = Vec::with_capacity(cursors.len());
+        for cursor in cursors {
+            let hover_info = client.request::<lsp::request::HoverRequest>(lsp::HoverParams {
+                text_document_position_params: lsp::TextDocumentPositionParams {
+                    text_document: lsp::TextDocumentIdentifier::new(uri.clone()),
+                    position: cursor,
+                },
+                work_done_progress_params: Default::default(),
+            });
+            hovers.push(hover_info);
+        }
 
-        assert_serialized_eq(
-            hover_info,
+        assert_serialized_eq(hovers, expected);
+    }
+
+    #[test]
+    fn hover() {
+        check_hover(
+            indoc::indoc! {r#"
+                fn main() {
+                    $dot(vec3(1.0), vec3(1, 2, 3));
+                }
+            "#},
             expect![[r#"
-                {
-                  "contents": {
-                    "kind": "markdown",
-                    "value": "Returns the dot product of e1 and e2.\n```wgsl\n// `T` is AbstractInt, AbstractFloat, `i32`, `u32`, `f32`, or `f16`\n@const @must_use fn dot ( e1: vecN<T>, e2: vecN<T> ) -> T\n```\n\n"
-                  },
-                  "range": {
-                    "start": {
-                      "line": 1,
-                      "character": 4
+                [
+                  {
+                    "contents": {
+                      "kind": "markdown",
+                      "value": "Returns the dot product of e1 and e2.\n```wgsl\n// `T` is AbstractInt, AbstractFloat, `i32`, `u32`, `f32`, or `f16`\n@const @must_use fn dot ( e1: vecN<T>, e2: vecN<T> ) -> T\n```\n\n"
                     },
-                    "end": {
-                      "line": 1,
-                      "character": 7
+                    "range": {
+                      "start": {
+                        "line": 1,
+                        "character": 4
+                      },
+                      "end": {
+                        "line": 1,
+                        "character": 7
+                      }
                     }
                   }
+                ]
+            "#]],
+        );
+    }
+
+    #[test]
+    fn hover_fields() {
+        check_hover(
+            indoc::indoc! {r#"
+                fn main() {
+                    let foo = Foo();
+                    foo.$bar.$baz;
                 }
+
+                struct Foo {
+                    bar: Bar,
+                }
+
+                struct Bar {
+                    baz: vec3f,
+                }
+            "#},
+            expect![[r#"
+                [
+                  {
+                    "contents": {
+                      "kind": "markdown",
+                      "value": "```wgsl\n: Bar\n```\n```wgsl\nbar: Bar,\n```\n\n"
+                    },
+                    "range": {
+                      "start": {
+                        "line": 2,
+                        "character": 8
+                      },
+                      "end": {
+                        "line": 2,
+                        "character": 11
+                      }
+                    }
+                  },
+                  {
+                    "contents": {
+                      "kind": "markdown",
+                      "value": "```wgsl\n: vec3<f32>\n```\n```wgsl\nbaz: vec3f,\n```\n\n"
+                    },
+                    "range": {
+                      "start": {
+                        "line": 2,
+                        "character": 12
+                      },
+                      "end": {
+                        "line": 2,
+                        "character": 15
+                      }
+                    }
+                  }
+                ]
             "#]],
         );
     }
