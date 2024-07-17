@@ -130,7 +130,7 @@ fn add_routes(router: &mut Router) {
 
         let parsed = document.parse();
         let range = parsed.tree.node(token).byte_range();
-        let documentation = symbol_documentation(document, &symbol.kind)?;
+        let documentation = symbol_documentation(document, &symbol.reference)?;
 
         Ok(Some(lsp::Hover {
             range: document.range_utf16_from_range_utf8(range),
@@ -156,40 +156,31 @@ fn add_routes(router: &mut Router) {
                 label: symbol.name,
                 documentation: Some(lsp::Documentation::MarkupContent(symbol_documentation(
                     document,
-                    &symbol.kind,
+                    &symbol.reference,
                 )?)),
                 ..Default::default()
             };
 
-            match &symbol.kind {
-                analyze::ResolvedSymbolKind::User(node) => {
-                    item.kind = match node {
-                        analyze::ReferenceNode::Alias(_) => Some(lsp::CompletionItemKind::CLASS),
-                        analyze::ReferenceNode::Struct(_) => Some(lsp::CompletionItemKind::STRUCT),
-                        analyze::ReferenceNode::StructField(_) => {
-                            Some(lsp::CompletionItemKind::FIELD)
-                        },
+            item.kind = Some(match &symbol.reference {
+                analyze::Reference::User(node) => match node {
+                    analyze::ReferenceNode::Alias(_) => lsp::CompletionItemKind::CLASS,
+                    analyze::ReferenceNode::Struct(_) => lsp::CompletionItemKind::STRUCT,
+                    analyze::ReferenceNode::StructField(_) => lsp::CompletionItemKind::FIELD,
 
-                        analyze::ReferenceNode::Fn(_) => Some(lsp::CompletionItemKind::FUNCTION),
+                    analyze::ReferenceNode::Fn(_) => lsp::CompletionItemKind::FUNCTION,
 
-                        analyze::ReferenceNode::Const(_) | analyze::ReferenceNode::Override(_) => {
-                            Some(lsp::CompletionItemKind::CONSTANT)
-                        },
+                    analyze::ReferenceNode::Const(_) | analyze::ReferenceNode::Override(_) => {
+                        lsp::CompletionItemKind::CONSTANT
+                    },
 
-                        analyze::ReferenceNode::Var(_)
-                        | analyze::ReferenceNode::FnParameter(_)
-                        | analyze::ReferenceNode::Let(_) => Some(lsp::CompletionItemKind::VARIABLE),
-                    };
+                    analyze::ReferenceNode::Var(_)
+                    | analyze::ReferenceNode::FnParameter(_)
+                    | analyze::ReferenceNode::Let(_) => lsp::CompletionItemKind::VARIABLE,
                 },
-
-                analyze::ResolvedSymbolKind::BuiltinFunction(_function) => {
-                    item.kind = Some(CompletionItemKind::FUNCTION);
-                },
-
-                analyze::ResolvedSymbolKind::BuiltinTypeAlias(_, _) => {
-                    item.kind = Some(CompletionItemKind::CLASS);
-                },
-            }
+                analyze::Reference::BuiltinFunction(_) => CompletionItemKind::FUNCTION,
+                analyze::Reference::BuiltinTypeAlias(_, _) => CompletionItemKind::CLASS,
+                analyze::Reference::Type(_) => CompletionItemKind::CLASS,
+            });
 
             completions.push(item);
         }
@@ -207,7 +198,7 @@ fn add_routes(router: &mut Router) {
             return Ok(None);
         };
 
-        let Some(name) = symbol.kind.name(&document.parse().tree) else { return Ok(None) };
+        let Some(name) = symbol.reference.name(&document.parse().tree) else { return Ok(None) };
         let range = name.byte_range();
 
         Ok(Some(lsp::GotoDefinitionResponse::Scalar(lsp::Location {
@@ -294,14 +285,14 @@ fn collect_diagnostics(state: &State, uri: &lsp::Uri) -> Result<Vec<lsp::Diagnos
 
 fn symbol_documentation(
     document: &workspace::Document,
-    symbol: &analyze::ResolvedSymbolKind,
+    reference: &analyze::Reference,
 ) -> Result<lsp::MarkupContent> {
     use std::fmt::Write;
 
     let mut markdown = String::new();
 
-    match symbol {
-        &analyze::ResolvedSymbolKind::User(node) => {
+    match reference {
+        &analyze::Reference::User(node) => {
             let tree = &document.parse().tree;
 
             let snippet_range = match node {
@@ -337,7 +328,7 @@ fn symbol_documentation(
             }
         },
 
-        analyze::ResolvedSymbolKind::BuiltinFunction(function) => {
+        analyze::Reference::BuiltinFunction(function) => {
             if let Some(description) = &function.description {
                 writeln!(markdown, "{}", description)?;
                 writeln!(markdown)?;
@@ -389,9 +380,17 @@ fn symbol_documentation(
             }
         },
 
-        analyze::ResolvedSymbolKind::BuiltinTypeAlias(name, original) => {
+        analyze::Reference::BuiltinTypeAlias(name, original) => {
             writeln!(markdown, "```wgsl")?;
             writeln!(markdown, "alias {name} = {original};")?;
+            writeln!(markdown, "```")?;
+        },
+
+        analyze::Reference::Type(typ) => {
+            let parsed = document.parse();
+            writeln!(markdown, "```wgsl")?;
+            typ.fmt(&mut markdown, &parsed.tree, document.content())?;
+            writeln!(markdown)?;
             writeln!(markdown, "```")?;
         },
     }

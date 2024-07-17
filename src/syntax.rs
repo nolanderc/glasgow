@@ -336,7 +336,14 @@ syntax_node_simple!(ArgumentList);
 
 syntax_node_simple!(ExprParens);
 syntax_node_simple!(ExprIndex);
-syntax_node_simple!(ExprMember);
+syntax_node_simple!(
+    ExprMember,
+    struct ExprMemberData {
+        target: Expression,
+        dot_token: Token!(Dot),
+        member: Token!(Identifier),
+    }
+);
 
 syntax_node_enum!(
     enum TypeSpecifier {
@@ -345,9 +352,30 @@ syntax_node_enum!(
     }
 );
 
-syntax_node_simple!(IdentifierWithTemplate);
+syntax_node_simple!(
+    IdentifierWithTemplate,
+    struct IdentifierWithTemplateData {
+        name: Token!(Identifier),
+        templates: TemplateList,
+    }
+);
 
 syntax_node_simple!(TemplateList);
+
+impl TemplateList {
+    pub fn parameters(self, tree: &Tree) -> impl Iterator<Item = TemplateParameter> + '_ {
+        self.0.children(tree).filter_map(TemplateParameter::new)
+    }
+}
+
+syntax_node_simple!(
+    TemplateParameter,
+    struct TemplateParameterData {
+        value: Expression,
+        comma: Token!(Comma),
+    }
+);
+
 syntax_node_simple!(AttributeList);
 
 syntax_node_simple!(

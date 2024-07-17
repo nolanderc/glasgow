@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap},
     num::NonZeroU32,
+    rc::Rc,
 };
 
 use crate::{
@@ -95,21 +96,19 @@ struct CaptureSymbols<'a> {
     references: Vec<(&'a str, Reference)>,
 }
 
-#[derive(Debug, Clone, Copy)]
-enum Reference {
-    Node(ReferenceNode),
+#[derive(Debug, Clone)]
+pub enum Reference {
+    User(ReferenceNode),
     BuiltinFunction(&'static wgsl_spec::Function),
     BuiltinTypeAlias(&'static String, &'static String),
+    Type(Type),
 }
 
-impl From<Reference> for ResolvedSymbolKind {
-    fn from(value: Reference) -> Self {
-        match value {
-            Reference::Node(node) => ResolvedSymbolKind::User(node),
-            Reference::BuiltinFunction(function) => ResolvedSymbolKind::BuiltinFunction(function),
-            Reference::BuiltinTypeAlias(name, original) => {
-                ResolvedSymbolKind::BuiltinTypeAlias(name, original)
-            },
+impl Reference {
+    pub fn name(&self, tree: &parse::Tree) -> Option<syntax::Token!(Identifier)> {
+        match self {
+            &Reference::User(node) => node.name(tree),
+            _ => None,
         }
     }
 }
@@ -216,15 +215,11 @@ impl<'a> Context<'a> {
     }
 
     pub fn get_node_symbol(&self, node: parse::NodeIndex) -> Option<ResolvedSymbol> {
-        let reference = self.references.get(&node)?;
-        let kind = match reference {
-            Reference::Node(node) => ResolvedSymbolKind::User(*node),
-            Reference::BuiltinFunction(function) => ResolvedSymbolKind::BuiltinFunction(function),
-            Reference::BuiltinTypeAlias(name, original) => {
-                ResolvedSymbolKind::BuiltinTypeAlias(name, original)
-            },
-        };
-        Some(ResolvedSymbol { name: self.source[self.tree.node(node).byte_range()].into(), kind })
+        let reference = self.references.get(&node)?.clone();
+        Some(ResolvedSymbol {
+            name: self.source[self.tree.node(node).byte_range()].into(),
+            reference,
+        })
     }
 
     pub fn capture_symbols_at(&mut self, node: parse::NodeIndex) {
@@ -236,7 +231,7 @@ impl<'a> Context<'a> {
         let mut symbols = Vec::with_capacity(capture.references.len());
 
         for (name, reference) in capture.references.iter() {
-            symbols.push(ResolvedSymbol { name: (*name).into(), kind: (*reference).into() });
+            symbols.push(ResolvedSymbol { name: (*name).into(), reference: reference.clone() });
         }
 
         symbols
@@ -244,13 +239,15 @@ impl<'a> Context<'a> {
 
     #[cold]
     fn capture_symbols(&mut self) {
-        let Some(capture) = &mut self.capture else { return };
+        // temporarily take the capture state to work around borrowing issues
+        let Some(mut capture) = self.capture.take() else { return };
+
         for (name, node) in self.scope.iter_symbols() {
-            capture.references.push((name, Reference::Node(node)));
+            capture.references.push((name, Reference::User(node)));
         }
 
         for (name, decl) in self.global_scope.iter() {
-            capture.references.push((name, Reference::Node(decl.node)))
+            capture.references.push((name, Reference::User(decl.node)))
         }
 
         for (name, function) in self.builtin_functions.functions.iter() {
@@ -260,6 +257,22 @@ impl<'a> Context<'a> {
         for (name, original) in self.builtin_tokens.type_aliases.iter() {
             capture.references.push((name, Reference::BuiltinTypeAlias(name, original)))
         }
+
+        for name in self.builtin_tokens.primitive_types.iter() {
+            let Some(typ) = self.parse_type_specifier(name) else {
+                unreachable!("could parse primitive type: {name}")
+            };
+            capture.references.push((name, Reference::Type(typ)));
+        }
+
+        for name in self.builtin_tokens.type_generators.iter() {
+            let Some(typ) = self.parse_type_specifier(name) else {
+                unreachable!("could parse type generator: {name}")
+            };
+            capture.references.push((name, Reference::Type(typ)));
+        }
+
+        self.capture = Some(capture);
     }
 
     fn resolve_references(&mut self, index: parse::NodeIndex) {
@@ -275,9 +288,9 @@ impl<'a> Context<'a> {
                 let name = &self.source[node.byte_range()];
 
                 if let Some(local) = self.scope.get(name) {
-                    self.references.insert(index, Reference::Node(local));
+                    self.references.insert(index, Reference::User(local));
                 } else if let Some(global) = self.global_scope.get(name) {
-                    self.references.insert(index, Reference::Node(global.node));
+                    self.references.insert(index, Reference::User(global.node));
                 } else if let Some(builtin) = self.builtin_functions.functions.get(name) {
                     self.references.insert(index, Reference::BuiltinFunction(builtin));
                 } else if let Some((name, original)) =
@@ -302,7 +315,10 @@ impl<'a> Context<'a> {
             },
 
             parse::Tag::ExprMember => {
-                // members cannot be resolved until types are known, so ignore this for now
+                let konst = syntax::ExprMember::new(syntax::SyntaxNode::new(node, index)).unwrap();
+                let data = konst.extract(self.tree);
+                self.resolve_references_maybe(data.target);
+                // the members themselves cannot be resolved until types are known
             },
 
             parse::Tag::StmtBlock => {
@@ -351,7 +367,7 @@ impl<'a> Context<'a> {
                 self.resolve_references_maybe(data.attributes);
                 if let Some(name) = data.name {
                     self.references
-                        .insert(name.index(), Reference::Node(ReferenceNode::StructField(field)));
+                        .insert(name.index(), Reference::User(ReferenceNode::StructField(field)));
                 }
                 self.resolve_references_maybe(data.typ);
             },
@@ -378,6 +394,12 @@ impl<'a> Context<'a> {
         }
     }
 
+    fn resolve_references_maybe(&mut self, index: Option<impl syntax::SyntaxNodeMatch>) {
+        if let Some(index) = index {
+            self.resolve_references(index.index());
+        }
+    }
+
     fn resolve_variable_declaration(
         &mut self,
         node: ReferenceNode,
@@ -388,15 +410,217 @@ impl<'a> Context<'a> {
         if let Some(name) = name {
             let text = &self.source[name.byte_range()];
             self.scope.insert(text, node);
-            self.references.insert(name.index(), Reference::Node(node));
+            self.references.insert(name.index(), Reference::User(node));
         }
         self.resolve_references_maybe(typ);
         self.resolve_references_maybe(value);
     }
 
-    fn resolve_references_maybe(&mut self, index: Option<impl syntax::SyntaxNodeMatch>) {
-        if let Some(index) = index {
-            self.resolve_references(index.index());
+    fn infer_type_expr(&mut self, node: syntax::SyntaxNode) -> Option<Type> {
+        let expr = syntax::Expression::new(node)?;
+        match expr {
+            syntax::Expression::Identifier(name) => match self.references.get(&name.index())? {
+                Reference::User(node) => match node {
+                    ReferenceNode::Struct(strukt) => Some(Type::Struct(*strukt)),
+                    _ => None,
+                },
+                Reference::BuiltinFunction(_) => None,
+                Reference::BuiltinTypeAlias(_, original) => self.parse_type_specifier(original),
+                Reference::Type(_) => None,
+            },
+            syntax::Expression::IdentifierWithTemplate(_) => todo!(),
+            syntax::Expression::IntegerDecimal(_) => todo!(),
+            syntax::Expression::IntegerHex(_) => todo!(),
+            syntax::Expression::FloatDecimal(_) => todo!(),
+            syntax::Expression::FloatHex(_) => todo!(),
+            syntax::Expression::True(_) => todo!(),
+            syntax::Expression::False(_) => todo!(),
+            syntax::Expression::Call(_) => todo!(),
+            syntax::Expression::Parens(_) => todo!(),
+            syntax::Expression::Index(_) => todo!(),
+            syntax::Expression::Member(_) => todo!(),
+        }
+    }
+
+    fn parse_type_specifier(&mut self, text: &str) -> Option<Type> {
+        let mut parser = parse::Parser::new();
+        let output = parse::parse_type_specifier(&mut parser, text);
+        let tree = &output.tree;
+        let node = syntax::SyntaxNode::new(tree.root(), tree.root_index());
+        let spec = syntax::TypeSpecifier::new(node)?;
+        self.type_from_specifier(spec, tree, text)
+    }
+
+    fn type_from_specifier(
+        &mut self,
+        spec: syntax::TypeSpecifier,
+        tree: &parse::Tree,
+        source: &str,
+    ) -> Option<Type> {
+        let (identifier, templates) = match spec {
+            syntax::TypeSpecifier::Identifier(name) => (name, None),
+            syntax::TypeSpecifier::IdentifierWithTemplate(identifier) => {
+                let data = identifier.extract(tree);
+                (data.name?, data.templates)
+            },
+        };
+
+        let mut params = templates
+            .into_iter()
+            .flat_map(|x| x.parameters(tree).filter_map(|x| x.extract(tree).value));
+
+        let name = &source[identifier.byte_range()];
+
+        let type_inner = |context: &mut Self, parameter: Option<syntax::Expression>| {
+            let spec = match parameter? {
+                syntax::Expression::Identifier(x) => syntax::TypeSpecifier::Identifier(x),
+                syntax::Expression::IdentifierWithTemplate(x) => {
+                    syntax::TypeSpecifier::IdentifierWithTemplate(x)
+                },
+                _ => return None,
+            };
+            context.type_from_specifier(spec, tree, source)
+        };
+
+        let scalar = |context: &mut Self, parameter: Option<syntax::Expression>| match type_inner(
+            context, parameter,
+        ) {
+            Some(Type::Scalar(scalar)) => Some(scalar),
+            _ => None,
+        };
+
+        let integer = |_: &mut Self, parameter: Option<syntax::Expression>| match parameter? {
+            syntax::Expression::IntegerDecimal(integer) => {
+                source[integer.byte_range()].parse::<u32>().ok()
+            },
+            syntax::Expression::IntegerHex(integer) => {
+                let digits =
+                    source[integer.byte_range()].trim_start_matches("0x").trim_start_matches("0X");
+                u32::from_str_radix(digits, 16).ok()
+            },
+            _ => None,
+        };
+
+        let address_space = |_: &mut Self, parameter: Option<syntax::Expression>| match parameter? {
+            syntax::Expression::Identifier(name) => {
+                AddressSpace::from_str(&source[name.byte_range()])
+            },
+            _ => None,
+        };
+
+        let format = |_: &mut Self, parameter: Option<syntax::Expression>| match parameter? {
+            syntax::Expression::Identifier(name) => {
+                TextureFormat::from_str(&source[name.byte_range()])
+            },
+            _ => None,
+        };
+
+        let access = |_: &mut Self, parameter: Option<syntax::Expression>| match parameter? {
+            syntax::Expression::Identifier(name) => {
+                AccessMode::from_str(&source[name.byte_range()])
+            },
+            _ => None,
+        };
+
+        if let Some(reference) = self.references.get(&identifier.index()) {
+            match reference {
+                Reference::User(node) => match node {
+                    ReferenceNode::Alias(alias) => {
+                        let spec = alias.extract(tree).typ?;
+                        return self.type_from_specifier(spec, tree, source);
+                    },
+                    ReferenceNode::Struct(strukt) => return Some(Type::Struct(*strukt)),
+                    _ => return None,
+                },
+
+                Reference::BuiltinFunction(_) => {
+                    // probably just shadowing the type constructors `u32`, `vec3`, etc.
+                    // we handle these manually below
+                },
+
+                Reference::BuiltinTypeAlias(_, original) => {
+                    return self.parse_type_specifier(original);
+                },
+
+                Reference::Type(typ) => return Some(typ.clone()),
+            }
+        }
+
+        match name {
+            "i32" => Some(Type::Scalar(TypeScalar::I32)),
+            "u32" => Some(Type::Scalar(TypeScalar::U32)),
+            "f32" => Some(Type::Scalar(TypeScalar::F32)),
+            "f16" => Some(Type::Scalar(TypeScalar::F16)),
+
+            "bool" => Some(Type::Scalar(TypeScalar::Bool)),
+
+            "vec2" => Some(Type::Vec(2, scalar(self, params.next()))),
+            "vec3" => Some(Type::Vec(3, scalar(self, params.next()))),
+            "vec4" => Some(Type::Vec(4, scalar(self, params.next()))),
+
+            "mat2x2" => Some(Type::Mat(2, 2, scalar(self, params.next()))),
+            "mat2x3" => Some(Type::Mat(2, 3, scalar(self, params.next()))),
+            "mat2x4" => Some(Type::Mat(2, 4, scalar(self, params.next()))),
+
+            "mat3x2" => Some(Type::Mat(3, 2, scalar(self, params.next()))),
+            "mat3x3" => Some(Type::Mat(3, 3, scalar(self, params.next()))),
+            "mat3x4" => Some(Type::Mat(3, 4, scalar(self, params.next()))),
+
+            "mat4x2" => Some(Type::Mat(4, 2, scalar(self, params.next()))),
+            "mat4x3" => Some(Type::Mat(4, 3, scalar(self, params.next()))),
+            "mat4x4" => Some(Type::Mat(4, 4, scalar(self, params.next()))),
+
+            "ptr" => Some(Type::Ptr(
+                address_space(self, params.next()),
+                type_inner(self, params.next()).map(Rc::new),
+                access(self, params.next()),
+            )),
+
+            "array" => Some(Type::Array(
+                type_inner(self, params.next()).map(Rc::new),
+                integer(self, params.next()).and_then(NonZeroU32::new),
+            )),
+
+            "atomic" => Some(Type::Atomic(scalar(self, params.next()))),
+
+            "sampler" => Some(Type::Sampler),
+            "sampler_comparison" => Some(Type::SamplerComparison),
+            "texture_depth_2d" => Some(Type::TextureDepth2d),
+            "texture_depth_2d_array" => Some(Type::TextureDepth2dArray),
+            "texture_depth_cube" => Some(Type::TextureDepthCube),
+            "texture_depth_cube_array" => Some(Type::TextureDepthCubeArray),
+            "texture_depth_multisampled_2d" => Some(Type::TextureDepthMultisampled2d),
+            "texture_external" => Some(Type::TextureExternal),
+
+            "texture_1d" => Some(Type::Texture1d(scalar(self, params.next()))),
+            "texture_2d" => Some(Type::Texture2d(scalar(self, params.next()))),
+            "texture_2d_array" => Some(Type::Texture2dArray(scalar(self, params.next()))),
+            "texture_3d" => Some(Type::Texture3d(scalar(self, params.next()))),
+            "texture_cube" => Some(Type::TextureCube(scalar(self, params.next()))),
+            "texture_cube_array" => Some(Type::TextureCubeArray(scalar(self, params.next()))),
+            "texture_multisampled_2d" => {
+                Some(Type::TextureMultisampled2d(scalar(self, params.next())))
+            },
+
+            "texture_storage_1d" => Some(Type::TextureStorage1d(
+                format(self, params.next()),
+                access(self, params.next()),
+            )),
+            "texture_storage_2d" => Some(Type::TextureStorage2d(
+                format(self, params.next()),
+                access(self, params.next()),
+            )),
+            "texture_storage_2d_array" => Some(Type::TextureStorage2dArray(
+                format(self, params.next()),
+                access(self, params.next()),
+            )),
+            "texture_storage_3d" => Some(Type::TextureStorage3d(
+                format(self, params.next()),
+                access(self, params.next()),
+            )),
+
+            // TODO: add samplers, textures, etc.
+            _ => None,
         }
     }
 }
@@ -496,74 +720,144 @@ impl<'a> Scope<'a> {
 #[derive(Debug)]
 pub struct ResolvedSymbol {
     pub name: String,
-    pub kind: ResolvedSymbolKind,
+    pub reference: Reference,
 }
 
-#[derive(Debug)]
-pub enum ResolvedSymbolKind {
-    User(ReferenceNode),
-    BuiltinFunction(&'static wgsl_spec::Function),
-    BuiltinTypeAlias(&'static String, &'static String),
+#[derive(Debug, Clone)]
+pub enum Type {
+    Scalar(TypeScalar),
+    Vec(u8, Option<TypeScalar>),
+    Mat(u8, u8, Option<TypeScalar>),
+    Atomic(Option<TypeScalar>),
+    Array(Option<Rc<Type>>, Option<NonZeroU32>),
+    Struct(syntax::DeclStruct),
+    Fn(syntax::DeclFn),
+
+    Ptr(Option<AddressSpace>, Option<Rc<Type>>, Option<AccessMode>),
+
+    Sampler,
+    SamplerComparison,
+    TextureDepth2d,
+    TextureDepth2dArray,
+    TextureDepthCube,
+    TextureDepthCubeArray,
+    TextureDepthMultisampled2d,
+    TextureExternal,
+
+    Texture1d(Option<TypeScalar>),
+    Texture2d(Option<TypeScalar>),
+    Texture2dArray(Option<TypeScalar>),
+    Texture3d(Option<TypeScalar>),
+    TextureCube(Option<TypeScalar>),
+    TextureCubeArray(Option<TypeScalar>),
+    TextureMultisampled2d(Option<TypeScalar>),
+
+    TextureStorage1d(Option<TextureFormat>, Option<AccessMode>),
+    TextureStorage2d(Option<TextureFormat>, Option<AccessMode>),
+    TextureStorage2dArray(Option<TextureFormat>, Option<AccessMode>),
+    TextureStorage3d(Option<TextureFormat>, Option<AccessMode>),
 }
 
-impl ResolvedSymbolKind {
-    pub fn name(&self, tree: &parse::Tree) -> Option<syntax::Token!(Identifier)> {
+impl Type {
+    pub fn fmt<F: std::fmt::Write>(
+        &self,
+        f: &mut F,
+        tree: &parse::Tree,
+        source: &str,
+    ) -> std::fmt::Result {
+        struct Maybe<'a, T>(&'a Option<T>);
+
+        impl<T: std::fmt::Display> std::fmt::Display for Maybe<'_, T> {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                match self.0 {
+                    Some(inner) => write!(f, "{inner}"),
+                    None => write!(f, "?"),
+                }
+            }
+        }
+
+        let type_maybe = |f: &mut F, typ: &Option<Rc<Type>>| -> std::fmt::Result {
+            if let Some(typ) = typ {
+                Type::fmt(typ, f, tree, source)
+            } else {
+                write!(f, "?")
+            }
+        };
+
         match self {
-            &ResolvedSymbolKind::User(node) => node.name(tree),
-            ResolvedSymbolKind::BuiltinFunction(_) | ResolvedSymbolKind::BuiltinTypeAlias(_, _) => {
-                None
+            Type::Scalar(scalar) => write!(f, "{scalar}"),
+
+            Type::Vec(dims, scalar) => write!(f, "vec{dims}<{}>", Maybe(scalar)),
+
+            Type::Mat(cols, rows, scalar) => write!(f, "mat{cols}x{rows}<{}>", Maybe(scalar)),
+
+            Type::Atomic(scalar) => write!(f, "atomic<{}>", Maybe(scalar)),
+
+            Type::Ptr(address, inner, access) => {
+                write!(f, "ptr<{}, ", Maybe(address))?;
+                type_maybe(f, inner)?;
+                if let Some(access) = access {
+                    write!(f, ", {access}")?;
+                }
+                write!(f, ">")?;
+                Ok(())
+            },
+
+            Type::Array(inner, count) => {
+                write!(f, "array<")?;
+                type_maybe(f, inner)?;
+                if let Some(count) = count {
+                    write!(f, ", {count}")?;
+                }
+                write!(f, ">")?;
+                Ok(())
+            },
+
+            Type::Struct(strukt) => {
+                let Some(name) = strukt.extract(tree).name else { return write!(f, "?struct?") };
+                write!(f, "{}", &source[name.byte_range()])
+            },
+            Type::Fn(func) => {
+                let Some(name) = func.extract(tree).name else { return write!(f, "?fn?") };
+                write!(f, "{}", &source[name.byte_range()])
+            },
+
+            Type::Sampler => write!(f, "sampler"),
+            Type::SamplerComparison => write!(f, "sampler_comparison"),
+            Type::TextureDepth2d => write!(f, "texture_depth_2d"),
+            Type::TextureDepth2dArray => write!(f, "texture_depth_2d_array"),
+            Type::TextureDepthCube => write!(f, "texture_depth_cube"),
+            Type::TextureDepthCubeArray => write!(f, "texture_depth_cube_array"),
+            Type::TextureDepthMultisampled2d => write!(f, "texture_depth_multisampled_2d"),
+            Type::TextureExternal => write!(f, "texture_external"),
+
+            Type::Texture1d(scalar) => write!(f, "texture_1d<{}>", Maybe(scalar)),
+            Type::Texture2d(scalar) => write!(f, "texture_2d<{}>", Maybe(scalar)),
+            Type::Texture2dArray(scalar) => write!(f, "texture_2d_array<{}>", Maybe(scalar)),
+            Type::Texture3d(scalar) => write!(f, "texture_3d<{}>", Maybe(scalar)),
+            Type::TextureCube(scalar) => write!(f, "texture_cube<{}>", Maybe(scalar)),
+            Type::TextureCubeArray(scalar) => write!(f, "texture_cube_array<{}>", Maybe(scalar)),
+            Type::TextureMultisampled2d(scalar) => {
+                write!(f, "texture_multisampled_2d<{}>", Maybe(scalar))
+            },
+
+            Type::TextureStorage1d(format, access) => {
+                write!(f, "texture_storage_1d<{}, {}>", Maybe(format), Maybe(access))
+            },
+            Type::TextureStorage2d(format, access) => {
+                write!(f, "texture_storage_2d<{}, {}>", Maybe(format), Maybe(access))
+            },
+            Type::TextureStorage2dArray(format, access) => {
+                write!(f, "texture_storage_2d_array<{}, {}>", Maybe(format), Maybe(access))
+            },
+            Type::TextureStorage3d(format, access) => {
+                write!(f, "texture_storage_3d<{}, {}>", Maybe(format), Maybe(access))
             },
         }
     }
 }
 
-#[derive(Debug)]
-pub enum Type {
-    Unknown,
-    Scalar(TypeScalar),
-    Vec(u8, TypeScalar),
-    Mat(u8, u8, TypeScalar),
-    Atomic(TypeScalar),
-    Array(Box<Type>, Option<NonZeroU32>),
-    Struct(Box<TypeStruct>),
-}
-
-const _: () = assert!(std::mem::size_of::<Type>() <= 16);
-
-#[derive(Debug)]
-pub struct TypeStruct {
-    pub name: String,
-    pub fields: Vec<TypeStructField>,
-}
-
-#[derive(Debug)]
-pub struct TypeStructField {
-    pub name: String,
-    pub typ: Type,
-}
-
-impl std::fmt::Display for Type {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Type::Unknown => write!(f, "?"),
-
-            Type::Scalar(scalar) => scalar.fmt(f),
-
-            Type::Vec(dims, scalar) => write!(f, "vec{dims}<{scalar}>"),
-
-            Type::Mat(cols, rows, scalar) => write!(f, "mat{cols}x{rows}<{scalar}>"),
-
-            Type::Atomic(scalar) => write!(f, "atomic<{scalar}>"),
-
-            Type::Array(inner, None) => write!(f, "array<{inner}>"),
-            Type::Array(inner, Some(count)) => write!(f, "array<{inner}, {count}>"),
-
-            Type::Struct(strukt) => write!(f, "{}", strukt.name),
-        }
-    }
-}
-
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum TypeScalar {
     I32,
     U32,
@@ -585,5 +879,152 @@ impl std::fmt::Display for TypeScalar {
             TypeScalar::AbstractInt => write!(f, "AbstractInt"),
             TypeScalar::AbstractFloat => write!(f, "AbstractFloat"),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum AddressSpace {
+    Function,
+    Private,
+    Workgroup,
+    Uniform,
+    Storage,
+    Handle,
+}
+
+impl AddressSpace {
+    pub fn from_str(text: &str) -> Option<AddressSpace> {
+        Some(match text {
+            "function" => AddressSpace::Function,
+            "private" => AddressSpace::Private,
+            "workgroup" => AddressSpace::Workgroup,
+            "uniform" => AddressSpace::Uniform,
+            "storage" => AddressSpace::Storage,
+            "handle" => AddressSpace::Handle,
+            _ => return None,
+        })
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            AddressSpace::Function => "function",
+            AddressSpace::Private => "private",
+            AddressSpace::Workgroup => "workgroup",
+            AddressSpace::Uniform => "uniform",
+            AddressSpace::Storage => "storage",
+            AddressSpace::Handle => "handle",
+        }
+    }
+}
+
+impl std::fmt::Display for AddressSpace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.as_str().fmt(f)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum TextureFormat {
+    Rgba8Unorm,
+    Rgba8Snorm,
+    Rgba8Uint,
+    Rgba8Sint,
+    Rgba16Uint,
+    Rgba16Sint,
+    Rgba16Float,
+    R32Uint,
+    R32Sint,
+    R32Float,
+    Rg32Uint,
+    Rg32Sint,
+    Rg32Float,
+    Rgba32Uint,
+    Rgba32Sint,
+    Rgba32Float,
+    Bgra8Unorm,
+}
+
+impl TextureFormat {
+    pub fn from_str(text: &str) -> Option<TextureFormat> {
+        Some(match text {
+            "rgba8unorm" => TextureFormat::Rgba8Unorm,
+            "rgba8snorm" => TextureFormat::Rgba8Snorm,
+            "rgba8uint" => TextureFormat::Rgba8Uint,
+            "rgba8sint" => TextureFormat::Rgba8Sint,
+            "rgba16uint" => TextureFormat::Rgba16Uint,
+            "rgba16sint" => TextureFormat::Rgba16Sint,
+            "rgba16float" => TextureFormat::Rgba16Float,
+            "r32uint" => TextureFormat::R32Uint,
+            "r32sint" => TextureFormat::R32Sint,
+            "r32float" => TextureFormat::R32Float,
+            "rg32uint" => TextureFormat::Rg32Uint,
+            "rg32sint" => TextureFormat::Rg32Sint,
+            "rg32float" => TextureFormat::Rg32Float,
+            "rgba32uint" => TextureFormat::Rgba32Uint,
+            "rgba32sint" => TextureFormat::Rgba32Sint,
+            "rgba32float" => TextureFormat::Rgba32Float,
+            "bgra8unorm" => TextureFormat::Bgra8Unorm,
+            _ => return None,
+        })
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            TextureFormat::Rgba8Unorm => "rgba8unorm",
+            TextureFormat::Rgba8Snorm => "rgba8snorm",
+            TextureFormat::Rgba8Uint => "rgba8uint",
+            TextureFormat::Rgba8Sint => "rgba8sint",
+            TextureFormat::Rgba16Uint => "rgba16uint",
+            TextureFormat::Rgba16Sint => "rgba16sint",
+            TextureFormat::Rgba16Float => "rgba16float",
+            TextureFormat::R32Uint => "r32uint",
+            TextureFormat::R32Sint => "r32sint",
+            TextureFormat::R32Float => "r32float",
+            TextureFormat::Rg32Uint => "rg32uint",
+            TextureFormat::Rg32Sint => "rg32sint",
+            TextureFormat::Rg32Float => "rg32float",
+            TextureFormat::Rgba32Uint => "rgba32uint",
+            TextureFormat::Rgba32Sint => "rgba32sint",
+            TextureFormat::Rgba32Float => "rgba32float",
+            TextureFormat::Bgra8Unorm => "bgra8unorm",
+        }
+    }
+}
+
+impl std::fmt::Display for TextureFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.as_str().fmt(f)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum AccessMode {
+    ReadOnly,
+    WriteOnly,
+    ReadWrite,
+}
+
+impl AccessMode {
+    pub fn from_str(text: &str) -> Option<AccessMode> {
+        Some(match text {
+            "read_only" => AccessMode::ReadOnly,
+            "write_only" => AccessMode::WriteOnly,
+            "read_write" => AccessMode::ReadWrite,
+            _ => return None,
+        })
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            AccessMode::ReadOnly => "read_only",
+            AccessMode::WriteOnly => "write_only",
+            AccessMode::ReadWrite => "read_write",
+        }
+    }
+}
+
+impl std::fmt::Display for AccessMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.as_str().fmt(f)
     }
 }
