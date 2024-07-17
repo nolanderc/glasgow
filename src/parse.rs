@@ -201,6 +201,8 @@ pub enum Tag {
     StmtLet,
     StmtContinuing,
     StmtAssign,
+    StmtIncrement,
+    StmtDecrement,
     StmtFor,
     StmtIf,
     StmtIfBranch,
@@ -596,7 +598,7 @@ impl<'src> Default for Parser<'src> {
 }
 
 impl<'src> Parser<'src> {
-    const MAX_FUEL: u32 = 32;
+    const MAX_FUEL: u32 = 128;
 
     pub fn new() -> Parser<'static> {
         Parser {
@@ -842,11 +844,11 @@ pub fn parse_file<'parser, 'src>(
                             parser.close(m, Tag::DeclFnParameterList);
                         }
 
+                        let mark_output = parser.open();
                         if parser.consume(Tag::ThinArrowRight) {
-                            let m = parser.open();
                             attribute_list_maybe(parser, m);
                             type_specifier(parser);
-                            parser.close(m, Tag::DeclFnOutput);
+                            parser.close(mark_output, Tag::DeclFnOutput);
                         }
 
                         statement_block(parser);
@@ -1105,8 +1107,6 @@ const ASSIGNMENT_OP: TokenSet = TokenSet::new(&[
     Tag::BarEqual,
 ]);
 
-const INCREMENT_DECREMENT_OP: TokenSet = TokenSet::new(&[Tag::PlusPlus, Tag::MinusMinus]);
-
 fn statement_expression(parser: &mut Parser) {
     let m = parser.open();
     expression(parser);
@@ -1116,10 +1116,14 @@ fn statement_expression(parser: &mut Parser) {
         expression(parser);
         parser.expect(Tag::SemiColon);
         parser.close(m, Tag::StmtAssign);
-    } else if parser.at_any(INCREMENT_DECREMENT_OP) {
+    } else if parser.at(Tag::PlusPlus) {
         parser.advance();
         parser.expect(Tag::SemiColon);
-        parser.close(m, Tag::StmtExpr);
+        parser.close(m, Tag::StmtIncrement);
+    } else if parser.at(Tag::MinusMinus) {
+        parser.advance();
+        parser.expect(Tag::SemiColon);
+        parser.close(m, Tag::StmtDecrement);
     } else {
         parser.expect(Tag::SemiColon);
         parser.close(m, Tag::StmtExpr);

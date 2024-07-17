@@ -223,7 +223,15 @@ syntax_node_simple!(
         fields: DeclStructFieldList,
     }
 );
+
 syntax_node_simple!(DeclStructFieldList);
+
+impl DeclStructFieldList {
+    pub fn fields(self, tree: &Tree) -> impl Iterator<Item = DeclStructField> + '_ {
+        self.0.children(tree).filter_map(DeclStructField::new)
+    }
+}
+
 syntax_node_simple!(
     DeclStructField,
     struct DeclStructFieldData {
@@ -297,9 +305,38 @@ syntax_node_simple!(
         typ: TypeSpecifier,
     }
 );
-syntax_node_simple!(DeclFnOutput);
+syntax_node_simple!(
+    DeclFnOutput,
+    struct DeclFnOutputData {
+        arrow_token: Token!(ThinArrowRight),
+        typ: TypeSpecifier,
+    }
+);
+
+syntax_node_enum!(
+    enum Statement {
+        Block(StmtBlock),
+        Expr(StmtExpr),
+        Const(DeclConst),
+        Var(DeclVar),
+        Let(StmtLet),
+    }
+);
 
 syntax_node_simple!(StmtBlock);
+impl StmtBlock {
+    pub fn statements(self, tree: &Tree) -> impl Iterator<Item = Statement> + '_ {
+        self.0.children(tree).filter_map(Statement::new)
+    }
+}
+
+syntax_node_simple!(
+    StmtExpr,
+    struct StmtExprData {
+        expr: Expression,
+        semi: Token!(SemiColon),
+    }
+);
 
 syntax_node_simple!(
     StmtLet,
@@ -331,11 +368,39 @@ syntax_node_enum!(
     }
 );
 
-syntax_node_simple!(ExprCall);
+syntax_node_simple!(
+    ExprCall,
+    struct ExprCallData {
+        target: Expression,
+        arguments: ArgumentList,
+    }
+);
+
 syntax_node_simple!(ArgumentList);
 
-syntax_node_simple!(ExprParens);
-syntax_node_simple!(ExprIndex);
+impl ArgumentList {
+    pub fn arguments(self, tree: &Tree) -> impl Iterator<Item = Expression> + '_ {
+        self.0.children(tree).filter_map(Expression::new)
+    }
+}
+
+syntax_node_simple!(
+    ExprParens,
+    struct ExprParensData {
+        lparen_token: Token!(LParen),
+        value: Expression,
+        rparen_token: Token!(RParen),
+    }
+);
+syntax_node_simple!(
+    ExprIndex,
+    struct ExprIndexData {
+        target: Expression,
+        lbracket_token: Token!(LBracket),
+        index: Expression,
+        rbracket_token: Token!(RBracket),
+    }
+);
 syntax_node_simple!(
     ExprMember,
     struct ExprMemberData {

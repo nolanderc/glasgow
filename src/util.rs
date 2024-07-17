@@ -36,3 +36,30 @@ impl std::fmt::Display for U24 {
         self.to_u32().fmt(f)
     }
 }
+
+pub struct FmtAdapter<F>(F);
+
+pub fn fmt_from_fn<F>(func: F) -> FmtAdapter<F>
+where
+    F: Fn(&mut std::fmt::Formatter) -> std::fmt::Result,
+{
+    FmtAdapter(func)
+}
+
+impl<F> std::fmt::Debug for FmtAdapter<F>
+where
+    F: Fn(&mut std::fmt::Formatter) -> std::fmt::Result,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        (self.0)(f)
+    }
+}
+
+impl<F> std::fmt::Display for FmtAdapter<F>
+where
+    F: Fn(&mut std::fmt::Formatter) -> std::fmt::Result,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        (self.0)(f)
+    }
+}

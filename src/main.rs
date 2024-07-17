@@ -261,18 +261,70 @@ fn collect_diagnostics(state: &State, uri: &lsp::Uri) -> Result<Vec<lsp::Diagnos
     let mut context =
         crate::analyze::Context::new(&global_scope.symbols, &parsed.tree, document.content());
     for decl in syntax::root(&parsed.tree).decls(&parsed.tree) {
-        context.reset();
-        let errors = context.analyze_decl(decl);
+        let errors = std::mem::take(context.analyze_decl(decl));
         for error in errors {
-            match error {
+            match &error {
                 analyze::Error::UnresolvedReference(unresolved) => {
-                    let node = parsed.tree.node(unresolved.node);
-                    let text = &document.content()[node.byte_range()];
-                    let byte_range = node.byte_range();
+                    let range = unresolved.node.byte_range();
+                    let text = &document.content()[range.clone()];
                     diagnostics.push(lsp::Diagnostic {
-                        range: document.range_utf16_from_range_utf8(byte_range).unwrap(),
+                        range: document.range_utf16_from_range_utf8(range).unwrap(),
                         severity: Some(lsp::DiagnosticSeverity::ERROR),
                         message: format!("unresolved reference to `{text}`"),
+                        ..Default::default()
+                    });
+                },
+
+                analyze::Error::InvalidCallTarget(expr, typ) => {
+                    let data = expr.extract(&parsed.tree);
+                    let index = data.target.map(|x| x.index()).unwrap_or(expr.index());
+                    let Some(range) = parsed.tree.byte_range_total(index) else { continue };
+                    diagnostics.push(lsp::Diagnostic {
+                        range: document.range_utf16_from_range_utf8(range).unwrap(),
+                        severity: Some(lsp::DiagnosticSeverity::ERROR),
+                        message: format!(
+                            "cannot call value of type `{}`",
+                            document.format_type(typ)
+                        ),
+                        ..Default::default()
+                    });
+                },
+                analyze::Error::InvalidIndexTarget(expr, typ) => {
+                    let data = expr.extract(&parsed.tree);
+                    let index = data.target.map(|x| x.index()).unwrap_or(expr.index());
+                    let Some(range) = parsed.tree.byte_range_total(index) else { continue };
+                    diagnostics.push(lsp::Diagnostic {
+                        range: document.range_utf16_from_range_utf8(range).unwrap(),
+                        severity: Some(lsp::DiagnosticSeverity::ERROR),
+                        message: format!(
+                            "cannot index into value of type `{}`",
+                            document.format_type(typ)
+                        ),
+                        ..Default::default()
+                    });
+                },
+                analyze::Error::InvalidIndexIndex(expr, typ) => {
+                    let data = expr.extract(&parsed.tree);
+                    let index = data.index.map(|x| x.index()).unwrap_or(expr.index());
+                    let Some(range) = parsed.tree.byte_range_total(index) else { continue };
+                    diagnostics.push(lsp::Diagnostic {
+                        range: document.range_utf16_from_range_utf8(range).unwrap(),
+                        severity: Some(lsp::DiagnosticSeverity::ERROR),
+                        message: format!("invalid index type `{}`", document.format_type(typ)),
+                        ..Default::default()
+                    });
+                },
+                analyze::Error::InvalidMember(expr, typ) => {
+                    let data = expr.extract(&parsed.tree);
+                    let index = data.member.map(|x| x.index()).unwrap_or(expr.index());
+                    let Some(range) = parsed.tree.byte_range_total(index) else { continue };
+                    diagnostics.push(lsp::Diagnostic {
+                        range: document.range_utf16_from_range_utf8(range).unwrap(),
+                        severity: Some(lsp::DiagnosticSeverity::ERROR),
+                        message: format!(
+                            "could not find field for type `{}`",
+                            document.format_type(typ)
+                        ),
                         ..Default::default()
                     });
                 },

@@ -1,4 +1,5 @@
 use std::{
+    cell::{Cell, RefCell},
     collections::{BTreeMap, HashMap},
     num::NonZeroU32,
     rc::Rc,
@@ -80,19 +81,23 @@ pub struct Context<'a> {
 
     scope: Scope<'a>,
 
-    errors: Vec<Error>,
+    errors: RefCell<Vec<Error>>,
 
     /// identifiers which have had their reference resolved.
-    references: HashMap<parse::NodeIndex, Reference>,
+    references: RefCell<HashMap<parse::NodeIndex, Reference>>,
+
+    /// The inferred type for each syntax node.
+    types: Cell<HashMap<parse::NodeIndex, Option<Type>>>,
 
     /// If set, we should record a capture of the visible symbols during name resolution.
-    capture: Option<CaptureSymbols<'a>>,
+    /// At which node we should perform the capture.
+    capture_node: Option<parse::NodeIndex>,
+    /// The references we captured during name resolution.
+    capture: CaptureSymbols<'a>,
 }
 
+#[derive(Default)]
 struct CaptureSymbols<'a> {
-    /// At which node we should perform the capture.
-    node: parse::NodeIndex,
-    /// The references we captured during name resolution.
     references: Vec<(&'a str, Reference)>,
 }
 
@@ -108,6 +113,11 @@ impl Reference {
     pub fn name(&self, tree: &parse::Tree) -> Option<syntax::Token!(Identifier)> {
         match self {
             &Reference::User(node) => node.name(tree),
+            Reference::Type(typ) => match typ {
+                Type::Struct(strukt) => strukt.extract(tree).name,
+                Type::Fn(func) => func.extract(tree).name,
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -172,11 +182,15 @@ impl ReferenceNode {
 #[derive(Debug)]
 pub enum Error {
     UnresolvedReference(ErrorUnresolvedReference),
+    InvalidCallTarget(syntax::ExprCall, Type),
+    InvalidIndexTarget(syntax::ExprIndex, Type),
+    InvalidIndexIndex(syntax::ExprIndex, Type),
+    InvalidMember(syntax::ExprMember, Type),
 }
 
 #[derive(Debug)]
 pub struct ErrorUnresolvedReference {
-    pub node: parse::NodeIndex,
+    pub node: syntax::Token!(Identifier),
 }
 
 impl<'a> Context<'a> {
@@ -189,97 +203,122 @@ impl<'a> Context<'a> {
             tree,
             source,
             scope: Scope::new(),
-            errors: Vec::new(),
-            references: HashMap::new(),
+            errors: Vec::new().into(),
+            references: Default::default(),
+            types: Default::default(),
 
-            capture: None,
+            capture_node: None,
+            capture: Default::default(),
         }
     }
 
     pub(crate) fn reset(&mut self) {
         self.scope.reset();
-        self.references.clear();
-        self.capture.take();
-        self.errors.clear();
+        self.references = Default::default();
+        self.capture = Default::default();
+        self.errors.get_mut().clear();
     }
 
     pub fn analyze_decl(&mut self, decl: syntax::Decl) -> &mut Vec<Error> {
         // name resolution:
-        {
-            let scope_root = self.scope.begin();
-            self.resolve_references(decl.index());
-            self.scope.end(scope_root);
+        let scope_root = self.scope.begin();
+        self.resolve_references(decl.index());
+        self.scope.end(scope_root);
+
+        match decl {
+            syntax::Decl::Alias(_) => {},
+            syntax::Decl::Struct(_) => {},
+            syntax::Decl::Const(konst) => {
+                let data = konst.extract(self.tree);
+                self.check_variable_decl_types(data.typ, data.value);
+            },
+            syntax::Decl::Override(overide) => {
+                let data = overide.extract(self.tree);
+                self.check_variable_decl_types(data.typ, data.value);
+            },
+            syntax::Decl::Var(war) => {
+                let data = war.extract(self.tree);
+                self.check_variable_decl_types(data.typ, data.value);
+            },
+            syntax::Decl::Fn(func) => {
+                let data = func.extract(self.tree);
+                if let Some(body) = data.body {
+                    self.check_stmt_types(syntax::Statement::Block(body))
+                }
+            },
         }
 
-        &mut self.errors
+        self.errors.get_mut()
     }
 
     pub fn get_node_symbol(&self, node: parse::NodeIndex) -> Option<ResolvedSymbol> {
-        let reference = self.references.get(&node)?.clone();
+        let reference = self.references.borrow().get(&node)?.clone();
+        let typ = self.type_of_reference(&reference).or_else(|| self.get_inferred_type(node));
         Some(ResolvedSymbol {
             name: self.source[self.tree.node(node).byte_range()].into(),
             reference,
+            typ,
         })
     }
 
     pub fn capture_symbols_at(&mut self, node: parse::NodeIndex) {
-        self.capture = Some(CaptureSymbols { node, references: Vec::new() });
+        self.capture_node = Some(node);
     }
 
     pub fn get_captured_symbols(&self) -> Vec<ResolvedSymbol> {
-        let Some(capture) = &self.capture else { return Vec::new() };
-        let mut symbols = Vec::with_capacity(capture.references.len());
+        let mut symbols = Vec::with_capacity(self.capture.references.len());
 
-        for (name, reference) in capture.references.iter() {
-            symbols.push(ResolvedSymbol { name: (*name).into(), reference: reference.clone() });
+        for (name, reference) in self.capture.references.iter() {
+            symbols.push(ResolvedSymbol {
+                name: (*name).into(),
+                reference: reference.clone(),
+                typ: self.type_of_reference(reference),
+            });
         }
 
         symbols
     }
 
     #[cold]
-    fn capture_symbols(&mut self) {
-        // temporarily take the capture state to work around borrowing issues
-        let Some(mut capture) = self.capture.take() else { return };
+    fn capture_symbols(&mut self) -> CaptureSymbols<'a> {
+        let mut references = Vec::new();
 
         for (name, node) in self.scope.iter_symbols() {
-            capture.references.push((name, Reference::User(node)));
+            references.push((name, Reference::User(node)));
         }
 
         for (name, decl) in self.global_scope.iter() {
-            capture.references.push((name, Reference::User(decl.node)))
+            references.push((name, Reference::User(decl.node)))
         }
 
         for (name, function) in self.builtin_functions.functions.iter() {
-            capture.references.push((name, Reference::BuiltinFunction(function)))
+            references.push((name, Reference::BuiltinFunction(function)))
         }
 
         for (name, original) in self.builtin_tokens.type_aliases.iter() {
-            capture.references.push((name, Reference::BuiltinTypeAlias(name, original)))
+            references.push((name, Reference::BuiltinTypeAlias(name, original)))
         }
 
         for name in self.builtin_tokens.primitive_types.iter() {
             let Some(typ) = self.parse_type_specifier(name) else {
                 unreachable!("could parse primitive type: {name}")
             };
-            capture.references.push((name, Reference::Type(typ)));
+            references.push((name, Reference::Type(typ)));
         }
 
         for name in self.builtin_tokens.type_generators.iter() {
             let Some(typ) = self.parse_type_specifier(name) else {
                 unreachable!("could parse type generator: {name}")
             };
-            capture.references.push((name, Reference::Type(typ)));
+            references.push((name, Reference::Type(typ)));
         }
 
-        self.capture = Some(capture);
+        CaptureSymbols { references }
     }
 
     fn resolve_references(&mut self, index: parse::NodeIndex) {
-        if let Some(capture) = &mut self.capture {
-            if index == capture.node {
-                self.capture_symbols();
-            }
+        if Some(index) == self.capture_node {
+            self.capture = self.capture_symbols();
         }
 
         let node = self.tree.node(index);
@@ -287,20 +326,29 @@ impl<'a> Context<'a> {
             parse::Tag::Identifier => {
                 let name = &self.source[node.byte_range()];
 
-                if let Some(local) = self.scope.get(name) {
-                    self.references.insert(index, Reference::User(local));
+                let reference = if let Some(local) = self.scope.get(name) {
+                    Reference::User(local)
                 } else if let Some(global) = self.global_scope.get(name) {
-                    self.references.insert(index, Reference::User(global.node));
+                    Reference::User(global.node)
                 } else if let Some(builtin) = self.builtin_functions.functions.get(name) {
-                    self.references.insert(index, Reference::BuiltinFunction(builtin));
+                    Reference::BuiltinFunction(builtin)
                 } else if let Some((name, original)) =
                     self.builtin_tokens.type_aliases.get_key_value(name)
                 {
-                    self.references.insert(index, Reference::BuiltinTypeAlias(name, original));
+                    Reference::BuiltinTypeAlias(name, original)
                 } else {
-                    self.errors
-                        .push(Error::UnresolvedReference(ErrorUnresolvedReference { node: index }));
-                }
+                    self.errors.get_mut().push(Error::UnresolvedReference(
+                        ErrorUnresolvedReference {
+                            node: <syntax::Token!(Identifier)>::new(syntax::SyntaxNode::new(
+                                node, index,
+                            ))
+                            .unwrap(),
+                        },
+                    ));
+                    return;
+                };
+
+                self.references.get_mut().insert(index, reference);
             },
 
             parse::Tag::Attribute => {
@@ -367,6 +415,7 @@ impl<'a> Context<'a> {
                 self.resolve_references_maybe(data.attributes);
                 if let Some(name) = data.name {
                     self.references
+                        .get_mut()
                         .insert(name.index(), Reference::User(ReferenceNode::StructField(field)));
                 }
                 self.resolve_references_maybe(data.typ);
@@ -410,39 +459,292 @@ impl<'a> Context<'a> {
         if let Some(name) = name {
             let text = &self.source[name.byte_range()];
             self.scope.insert(text, node);
-            self.references.insert(name.index(), Reference::User(node));
+            self.references.get_mut().insert(name.index(), Reference::User(node));
         }
         self.resolve_references_maybe(typ);
         self.resolve_references_maybe(value);
     }
 
-    fn infer_type_expr(&mut self, node: syntax::SyntaxNode) -> Option<Type> {
-        let expr = syntax::Expression::new(node)?;
-        match expr {
-            syntax::Expression::Identifier(name) => match self.references.get(&name.index())? {
-                Reference::User(node) => match node {
-                    ReferenceNode::Struct(strukt) => Some(Type::Struct(*strukt)),
-                    _ => None,
-                },
-                Reference::BuiltinFunction(_) => None,
-                Reference::BuiltinTypeAlias(_, original) => self.parse_type_specifier(original),
-                Reference::Type(_) => None,
+    fn check_variable_decl_types(
+        &self,
+        _typ: Option<syntax::TypeSpecifier>,
+        value: Option<syntax::Expression>,
+    ) {
+        // TODO: ensure the type of the expression is valid
+        self.infer_type_expr_maybe(value);
+    }
+
+    fn check_stmt_types(&self, stmt: syntax::Statement) {
+        match stmt {
+            syntax::Statement::Block(block) => {
+                for stmt in block.statements(self.tree) {
+                    self.check_stmt_types(stmt);
+                }
             },
-            syntax::Expression::IdentifierWithTemplate(_) => todo!(),
-            syntax::Expression::IntegerDecimal(_) => todo!(),
-            syntax::Expression::IntegerHex(_) => todo!(),
-            syntax::Expression::FloatDecimal(_) => todo!(),
-            syntax::Expression::FloatHex(_) => todo!(),
-            syntax::Expression::True(_) => todo!(),
-            syntax::Expression::False(_) => todo!(),
-            syntax::Expression::Call(_) => todo!(),
-            syntax::Expression::Parens(_) => todo!(),
-            syntax::Expression::Index(_) => todo!(),
-            syntax::Expression::Member(_) => todo!(),
+            syntax::Statement::Expr(expr) => {
+                let data = expr.extract(self.tree);
+                self.infer_type_expr_maybe(data.expr);
+            },
+            syntax::Statement::Const(konst) => {
+                let data = konst.extract(self.tree);
+                self.check_variable_decl_types(data.typ, data.value);
+            },
+            syntax::Statement::Var(war) => {
+                let data = war.extract(self.tree);
+                self.check_variable_decl_types(data.typ, data.value);
+            },
+            syntax::Statement::Let(lett) => {
+                let data = lett.extract(self.tree);
+                self.check_variable_decl_types(data.typ, data.value);
+            },
         }
     }
 
-    fn parse_type_specifier(&mut self, text: &str) -> Option<Type> {
+    fn infer_type_expr(&self, expr: syntax::Expression) -> Option<Type> {
+        let mut cache = self.types.take();
+
+        let typ = match cache.entry(expr.index()) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.get().as_ref().cloned(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(self.infer_type_expr_uncached(expr)).as_ref().cloned()
+            },
+        };
+
+        self.types.set(cache);
+
+        typ
+    }
+
+    fn get_inferred_type(&self, node: parse::NodeIndex) -> Option<Type> {
+        let cache = self.types.take();
+        let typ = cache.get(&node).cloned().flatten();
+        self.types.set(cache);
+        typ
+    }
+
+    fn infer_type_expr_maybe(&self, expr: Option<syntax::Expression>) -> Option<Type> {
+        self.infer_type_expr(expr?)
+    }
+
+    fn infer_type_expr_uncached(&self, expr: syntax::Expression) -> Option<Type> {
+        match expr {
+            syntax::Expression::Identifier(name) => {
+                self.type_of_reference(self.references.borrow().get(&name.index())?)
+            },
+            syntax::Expression::IdentifierWithTemplate(identifier) => self
+                .type_from_specifier(
+                    syntax::TypeSpecifier::IdentifierWithTemplate(identifier),
+                    self.tree,
+                    self.source,
+                )
+                .map(|x| Type::Type(Rc::new(x))),
+            syntax::Expression::IntegerDecimal(number) => {
+                match self.source[number.byte_range()].chars().next_back() {
+                    Some('u') => Some(Type::Scalar(TypeScalar::U32)),
+                    Some('i') => Some(Type::Scalar(TypeScalar::I32)),
+                    _ => Some(Type::Scalar(TypeScalar::AbstractInt)),
+                }
+            },
+            syntax::Expression::IntegerHex(number) => {
+                match self.source[number.byte_range()].chars().next_back() {
+                    Some('u') => Some(Type::Scalar(TypeScalar::U32)),
+                    Some('i') => Some(Type::Scalar(TypeScalar::I32)),
+                    _ => Some(Type::Scalar(TypeScalar::AbstractInt)),
+                }
+            },
+            syntax::Expression::FloatDecimal(number) => {
+                match self.source[number.byte_range()].chars().next_back() {
+                    Some('f') => Some(Type::Scalar(TypeScalar::F32)),
+                    Some('h') => Some(Type::Scalar(TypeScalar::F16)),
+                    _ => Some(Type::Scalar(TypeScalar::AbstractInt)),
+                }
+            },
+            syntax::Expression::FloatHex(number) => {
+                match self.source[number.byte_range()].chars().next_back() {
+                    Some('f') => Some(Type::Scalar(TypeScalar::F32)),
+                    Some('h') => Some(Type::Scalar(TypeScalar::F16)),
+                    _ => Some(Type::Scalar(TypeScalar::AbstractInt)),
+                }
+            },
+
+            syntax::Expression::True(_) | syntax::Expression::False(_) => {
+                Some(Type::Scalar(TypeScalar::Bool))
+            },
+            syntax::Expression::Call(call) => {
+                let data = call.extract(self.tree);
+                let target_type = self.infer_type_expr_maybe(data.target);
+
+                if let Some(arguments) = data.arguments {
+                    for argument in arguments.arguments(self.tree) {
+                        // TODO: check that the type is valid for the given argument
+                        self.infer_type_expr(argument);
+                    }
+                }
+
+                match target_type? {
+                    Type::Type(typ) => Some(Type::clone(&typ)),
+                    Type::Fn(func) => {
+                        let data = func.extract(self.tree);
+                        let spec = data.output?.extract(self.tree).typ?;
+                        self.type_from_specifier(spec, self.tree, self.source)
+                    },
+                    typ => {
+                        self.errors.borrow_mut().push(Error::InvalidCallTarget(call, typ));
+                        None
+                    },
+                }
+            },
+
+            syntax::Expression::Parens(parens) => {
+                let data = parens.extract(self.tree);
+                self.infer_type_expr_maybe(data.value)
+            },
+
+            syntax::Expression::Index(index) => {
+                let data = index.extract(self.tree);
+                let target_type = self.infer_type_expr_maybe(data.target);
+                let index_type = self.infer_type_expr_maybe(data.index);
+
+                let target_type = target_type?;
+                let element = match &target_type {
+                    Type::Array(Some(element), _) => Some(element),
+                    Type::Ptr(_, Some(inner), _) => match &**inner {
+                        Type::Array(Some(element), _) => Some(element),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+
+                let Some(element) = element else {
+                    self.errors.borrow_mut().push(Error::InvalidIndexTarget(index, target_type));
+                    return None;
+                };
+
+                if let Some(typ) = index_type {
+                    if !matches!(typ, Type::Scalar(TypeScalar::I32 | TypeScalar::U32)) {
+                        self.errors.borrow_mut().push(Error::InvalidIndexIndex(index, typ));
+                    }
+                }
+
+                Some(Type::clone(element))
+            },
+
+            syntax::Expression::Member(expr_member) => {
+                let data = expr_member.extract(self.tree);
+                let target_type = self.infer_type_expr_maybe(data.target)?;
+
+                let member = data.member?;
+                let member_text = &self.source[member.byte_range()];
+
+                match target_type {
+                    Type::Vec(count, scalar) => {
+                        let xyzw = &b"xyzw"[..count as usize];
+                        let rgba = &b"rgba"[..count as usize];
+
+                        let is_xyzw = member_text.bytes().all(|x| xyzw.contains(&x));
+                        let is_rgba = member_text.bytes().all(|x| rgba.contains(&x));
+                        if !is_xyzw && !is_rgba {
+                            self.errors
+                                .borrow_mut()
+                                .push(Error::InvalidMember(expr_member, target_type));
+                        }
+
+                        if count == 1 {
+                            scalar.map(Type::Scalar)
+                        } else {
+                            Some(Type::Vec(count, scalar))
+                        }
+                    },
+                    Type::Struct(strukt) => {
+                        let data = strukt.extract(self.tree);
+                        let fields = data.fields?;
+                        for field in fields.fields(self.tree) {
+                            let data_field = field.extract(self.tree);
+                            if let Some(field_name) = data_field.name {
+                                let field_text = &self.source[field_name.byte_range()];
+                                if field_text == member_text {
+                                    let spec = data_field.typ?;
+                                    self.references.borrow_mut().insert(
+                                        member.index(),
+                                        Reference::User(ReferenceNode::StructField(field)),
+                                    );
+                                    return self.type_from_specifier(spec, self.tree, self.source);
+                                }
+                            }
+                        }
+
+                        self.errors
+                            .borrow_mut()
+                            .push(Error::InvalidMember(expr_member, target_type));
+
+                        None
+                    },
+                    _ => {
+                        self.errors
+                            .borrow_mut()
+                            .push(Error::InvalidMember(expr_member, target_type));
+                        None
+                    },
+                }
+            },
+        }
+    }
+
+    fn type_of_reference(&self, reference: &Reference) -> Option<Type> {
+        match reference {
+            Reference::User(node) => match node {
+                ReferenceNode::Struct(strukt) => Some(Type::Type(Rc::new(Type::Struct(*strukt)))),
+                ReferenceNode::Fn(func) => Some(Type::Fn(*func)),
+
+                ReferenceNode::Alias(alias) => {
+                    let spec = alias.extract(self.tree).typ?;
+                    self.type_from_specifier(spec, self.tree, self.source)
+                },
+
+                ReferenceNode::StructField(field) => {
+                    let data = field.extract(self.tree);
+                    self.type_of_variable(data.typ, None)
+                },
+                ReferenceNode::Const(konst) => {
+                    let data = konst.extract(self.tree);
+                    self.type_of_variable(data.typ, data.value)
+                },
+                ReferenceNode::Override(overide) => {
+                    let data = overide.extract(self.tree);
+                    self.type_of_variable(data.typ, data.value)
+                },
+                ReferenceNode::Var(war) => {
+                    let data = war.extract(self.tree);
+                    self.type_of_variable(data.typ, data.value)
+                },
+                ReferenceNode::FnParameter(param) => {
+                    let data = param.extract(self.tree);
+                    self.type_of_variable(data.typ, None)
+                },
+                ReferenceNode::Let(lett) => {
+                    let data = lett.extract(self.tree);
+                    self.type_of_variable(data.typ, data.value)
+                },
+            },
+            Reference::BuiltinFunction(_) => None,
+            Reference::BuiltinTypeAlias(_, original) => self.parse_type_specifier(original),
+            Reference::Type(typ) => Some(Type::Type(Rc::new(typ.clone()))),
+        }
+    }
+
+    fn type_of_variable(
+        &self,
+        spec: Option<syntax::TypeSpecifier>,
+        value: Option<syntax::Expression>,
+    ) -> Option<Type> {
+        if let Some(spec) = spec {
+            self.type_from_specifier(spec, self.tree, self.source)
+        } else {
+            self.infer_type_expr(value?)
+        }
+    }
+
+    fn parse_type_specifier(&self, text: &str) -> Option<Type> {
         let mut parser = parse::Parser::new();
         let output = parse::parse_type_specifier(&mut parser, text);
         let tree = &output.tree;
@@ -452,7 +754,7 @@ impl<'a> Context<'a> {
     }
 
     fn type_from_specifier(
-        &mut self,
+        &self,
         spec: syntax::TypeSpecifier,
         tree: &parse::Tree,
         source: &str,
@@ -471,7 +773,7 @@ impl<'a> Context<'a> {
 
         let name = &source[identifier.byte_range()];
 
-        let type_inner = |context: &mut Self, parameter: Option<syntax::Expression>| {
+        let type_inner = |context: &Self, parameter: Option<syntax::Expression>| {
             let spec = match parameter? {
                 syntax::Expression::Identifier(x) => syntax::TypeSpecifier::Identifier(x),
                 syntax::Expression::IdentifierWithTemplate(x) => {
@@ -482,67 +784,52 @@ impl<'a> Context<'a> {
             context.type_from_specifier(spec, tree, source)
         };
 
-        let scalar = |context: &mut Self, parameter: Option<syntax::Expression>| match type_inner(
+        let scalar = |context: &Self, parameter: Option<syntax::Expression>| match type_inner(
             context, parameter,
         ) {
             Some(Type::Scalar(scalar)) => Some(scalar),
             _ => None,
         };
 
-        let integer = |_: &mut Self, parameter: Option<syntax::Expression>| match parameter? {
-            syntax::Expression::IntegerDecimal(integer) => {
-                source[integer.byte_range()].parse::<u32>().ok()
-            },
+        let integer = |_: &Self, parameter: Option<syntax::Expression>| match parameter? {
+            syntax::Expression::IntegerDecimal(integer) => source[integer.byte_range()]
+                .trim_end_matches(|x| x == 'i' || x == 'u')
+                .parse::<u32>()
+                .ok(),
             syntax::Expression::IntegerHex(integer) => {
-                let digits =
-                    source[integer.byte_range()].trim_start_matches("0x").trim_start_matches("0X");
+                let digits = source[integer.byte_range()]
+                    .trim_start_matches("0x")
+                    .trim_start_matches("0X")
+                    .trim_end_matches(|x| x == 'i' || x == 'u');
                 u32::from_str_radix(digits, 16).ok()
             },
             _ => None,
         };
 
-        let address_space = |_: &mut Self, parameter: Option<syntax::Expression>| match parameter? {
+        let address_space = |_: &Self, parameter: Option<syntax::Expression>| match parameter? {
             syntax::Expression::Identifier(name) => {
                 AddressSpace::from_str(&source[name.byte_range()])
             },
             _ => None,
         };
 
-        let format = |_: &mut Self, parameter: Option<syntax::Expression>| match parameter? {
+        let format = |_: &Self, parameter: Option<syntax::Expression>| match parameter? {
             syntax::Expression::Identifier(name) => {
                 TextureFormat::from_str(&source[name.byte_range()])
             },
             _ => None,
         };
 
-        let access = |_: &mut Self, parameter: Option<syntax::Expression>| match parameter? {
+        let access = |_: &Self, parameter: Option<syntax::Expression>| match parameter? {
             syntax::Expression::Identifier(name) => {
                 AccessMode::from_str(&source[name.byte_range()])
             },
             _ => None,
         };
 
-        if let Some(reference) = self.references.get(&identifier.index()) {
-            match reference {
-                Reference::User(node) => match node {
-                    ReferenceNode::Alias(alias) => {
-                        let spec = alias.extract(tree).typ?;
-                        return self.type_from_specifier(spec, tree, source);
-                    },
-                    ReferenceNode::Struct(strukt) => return Some(Type::Struct(*strukt)),
-                    _ => return None,
-                },
-
-                Reference::BuiltinFunction(_) => {
-                    // probably just shadowing the type constructors `u32`, `vec3`, etc.
-                    // we handle these manually below
-                },
-
-                Reference::BuiltinTypeAlias(_, original) => {
-                    return self.parse_type_specifier(original);
-                },
-
-                Reference::Type(typ) => return Some(typ.clone()),
+        if let Some(reference) = self.references.borrow().get(&identifier.index()) {
+            if let Some(typ) = self.type_of_reference(reference) {
+                return Some(typ);
             }
         }
 
@@ -721,10 +1008,15 @@ impl<'a> Scope<'a> {
 pub struct ResolvedSymbol {
     pub name: String,
     pub reference: Reference,
+    pub typ: Option<Type>,
 }
 
 #[derive(Debug, Clone)]
 pub enum Type {
+    /// The type of a specific type. For example, `u32` in source code would have the type
+    /// `Type(u32)`, while the number `123u` would have the actual type `u32`.
+    Type(Rc<Type>),
+
     Scalar(TypeScalar),
     Vec(u8, Option<TypeScalar>),
     Mat(u8, u8, Option<TypeScalar>),
@@ -785,6 +1077,13 @@ impl Type {
         };
 
         match self {
+            Type::Type(inner) => {
+                write!(f, "type<")?;
+                inner.fmt(f, tree, source)?;
+                write!(f, ">")?;
+                Ok(())
+            },
+
             Type::Scalar(scalar) => write!(f, "{scalar}"),
 
             Type::Vec(dims, scalar) => write!(f, "vec{dims}<{}>", Maybe(scalar)),

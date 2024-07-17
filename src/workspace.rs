@@ -210,16 +210,6 @@ impl Document {
 
         let decl_index = *token_path.get(1)?;
         let decl = crate::syntax::Decl::from_tree(&parsed.tree, decl_index)?;
-        if let Some(name) = decl.name(&parsed.tree) {
-            if name.index() == token {
-                let text = &self.content[name.byte_range()];
-                let symbol = crate::analyze::ResolvedSymbol {
-                    name: text.into(),
-                    reference: crate::analyze::Reference::User(decl.into()),
-                };
-                return Some((symbol, token));
-            }
-        }
 
         let global_scope = &self.global_scope().symbols;
         let mut context = analyze::Context::new(global_scope, &parsed.tree, &self.content);
@@ -249,6 +239,12 @@ impl Document {
         let symbols = context.get_captured_symbols();
 
         Some((symbols, token))
+    }
+
+    pub fn format_type<'a>(&'a self, typ: &'a crate::analyze::Type) -> impl std::fmt::Display + 'a {
+        let tree = &self.parse().tree;
+        let source = self.content();
+        crate::util::fmt_from_fn(move |f| typ.fmt(f, tree, source))
     }
 }
 
