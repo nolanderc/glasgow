@@ -398,6 +398,25 @@ pub enum ResolvedSymbolKind {
     BuiltinFunction(&'static wgsl_spec::Function),
 }
 
+impl ResolvedSymbolKind {
+    pub fn name(&self, tree: &parse::Tree) -> Option<syntax::Token!(Identifier)> {
+        match self {
+            &ResolvedSymbolKind::User(index) => {
+                if let Some(decl) = syntax::Decl::from_tree(tree, index) {
+                    return decl.name(tree);
+                }
+
+                if let Some(lett) = syntax::StmtLet::from_tree(tree, index) {
+                    return lett.extract(tree).name;
+                }
+
+                None
+            },
+            ResolvedSymbolKind::BuiltinFunction(_) => None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum Type {
     Unknown,

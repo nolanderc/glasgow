@@ -173,7 +173,24 @@ fn add_routes(router: &mut Router) {
         }
 
         Ok(Some(lsp::CompletionResponse::Array(completions)))
-    })
+    });
+
+    router.handle_request::<lsp::request::GotoDefinition>(|state, request| {
+        let location = request.text_document_position_params;
+        let document = state.workspace.document(&location.text_document.uri)?;
+        let offset = document
+            .offset_utf8_from_position_utf16(location.position)
+            .context("invalid position")?;
+        let Some((symbol, _token)) = document.symbol_at_offset(offset) else { return Ok(None) };
+
+        let Some(name) = symbol.kind.name(&document.parse().tree) else { return Ok(None) };
+        let range = name.byte_range();
+
+        Ok(Some(lsp::GotoDefinitionResponse::Scalar(lsp::Location {
+            uri: location.text_document.uri,
+            range: document.range_utf16_from_range_utf8(range).unwrap(),
+        })))
+    });
 }
 
 fn publish_diagnostics_for_document(
@@ -355,6 +372,7 @@ fn run_server(_arguments: Arguments, connection: lsp_server::Connection) -> Resu
             work_done_progress_options: Default::default(),
             completion_item: None,
         }),
+        definition_provider: Some(lsp::OneOf::Left(true)),
         ..Default::default()
     };
 
