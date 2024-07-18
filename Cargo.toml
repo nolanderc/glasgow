@@ -1,6 +1,6 @@
 [package]
 name = "glasgow"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Language Server for WGSL (WebGPU Shading Language)"
 repository = "https://github.com/nolanderc/glasgow"
