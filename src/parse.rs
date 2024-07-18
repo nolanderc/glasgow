@@ -553,24 +553,6 @@ impl Tree {
         path.reverse();
         path
     }
-
-    /// Get the parent node of the given node (if it exists)
-    ///
-    /// Utilizes the fact that the parent of a node is always added to the tree after the child
-    /// itself, so will always have a higher index. Altough this should be fast is most cases, this
-    /// has a worst-case time complexity of `O(n)`, so should be used sparingly.
-    pub fn parent(&self, index: NodeIndex) -> Option<NodeIndex> {
-        for candidate in index.0 as usize + 1..self.nodes.len() {
-            let node = self.nodes[candidate];
-            if node.is_syntax() {
-                let children = node.children_range();
-                if children.contains(&(index.0 as usize)) {
-                    return Some(NodeIndex(candidate as u32));
-                }
-            }
-        }
-        None
-    }
 }
 
 #[derive(Debug, Clone, Copy)]

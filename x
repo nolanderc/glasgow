@@ -36,6 +36,10 @@ function watch {
     watchexec -e rs,toml -c --on-busy-update=restart -- ./x "$@"
 }
 
+function exec {
+    "$@"
+}
+
 if [[ $# == 0 ]]; then
     list
     exit 1

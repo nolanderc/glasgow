@@ -2,6 +2,9 @@
 name = "glasgow"
 version = "0.1.0"
 edition = "2021"
+description = "Language Server for WGSL (WebGPU Shading Language)"
+repository = "https://github.com/nolanderc/glasgow"
+license-file = "LICENSE"
 
 [dependencies]
 clap = { version = "4.5.9", features = ["derive"] }
