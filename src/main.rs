@@ -178,6 +178,7 @@ fn add_routes(router: &mut Router) {
                 analyze::Reference::BuiltinFunction(_) => CompletionItemKind::FUNCTION,
                 analyze::Reference::BuiltinTypeAlias(_, _) => CompletionItemKind::CLASS,
                 analyze::Reference::BuiltinType(_) => CompletionItemKind::CLASS,
+                analyze::Reference::Swizzle(_, _) => CompletionItemKind::FIELD,
             });
 
             completions.push(item);
@@ -385,55 +386,7 @@ fn symbol_documentation(
         },
 
         analyze::Reference::BuiltinFunction(function) => {
-            if let Some(description) = &function.description {
-                writeln!(markdown, "{}", description)?;
-                writeln!(markdown)?;
-            }
-
-            for overload in function.overloads.iter() {
-                if let Some(description) = &overload.description {
-                    if !description.trim().is_empty() {
-                        for line in description.lines() {
-                            writeln!(markdown, "{}", line)?;
-                        }
-                    }
-                }
-
-                writeln!(markdown, "```wgsl")?;
-                for (typevar, values) in overload.parameterization.typevars.iter() {
-                    write!(markdown, "// ")?;
-                    match values {
-                        wgsl_spec::ParameterizationKind::Types(types) => {
-                            write!(markdown, "`{typevar}` is ")?;
-                            for (i, typ) in types.iter().enumerate() {
-                                if i != 0 {
-                                    if i == types.len() - 1 {
-                                        write!(markdown, ", or ")?;
-                                    } else {
-                                        write!(markdown, ", ")?;
-                                    }
-                                }
-
-                                if typ.starts_with("Abstract") {
-                                    write!(markdown, "{typ}")?;
-                                } else {
-                                    write!(markdown, "`{typ}`")?;
-                                }
-                            }
-                            writeln!(markdown)?;
-                        },
-                        wgsl_spec::ParameterizationKind::Description(description) => {
-                            writeln!(markdown, "`{typevar}` {description}")?;
-                        },
-                    }
-                }
-
-                for line in overload.signature.trim().lines() {
-                    writeln!(markdown, "{line}")?;
-                }
-                writeln!(markdown, "```")?;
-                writeln!(markdown)?;
-            }
+            documentation_builtin_function(&mut markdown, function)?;
         },
 
         analyze::Reference::BuiltinTypeAlias(name, original) => {
@@ -443,15 +396,97 @@ fn symbol_documentation(
         },
 
         analyze::Reference::BuiltinType(typ) => {
+            writeln!(markdown, "```wgsl")?;
+            for line in typ.trim().lines() {
+                writeln!(markdown, "{line}")?;
+            }
+            writeln!(markdown, "```")?;
+
+            let functions = analyze::get_builtin_functions();
+            if let Some(func) = functions.functions.get(*typ) {
+                documentation_builtin_function(&mut markdown, func)?;
+            }
+        },
+
+        analyze::Reference::Swizzle(count, scalar) => {
             let parsed = document.parse();
             writeln!(markdown, "```wgsl")?;
-            typ.fmt(&mut markdown, &parsed.tree, document.content())?;
-            writeln!(markdown)?;
+            if *count == 1 {
+                if let Some(scalar) = scalar {
+                    writeln!(markdown, "{scalar}")?;
+                }
+            } else {
+                analyze::Type::Vec(*count, *scalar).fmt(
+                    &mut markdown,
+                    &parsed.tree,
+                    document.content(),
+                )?;
+                writeln!(markdown)?;
+            }
             writeln!(markdown, "```")?;
         },
     }
 
     Ok(lsp::MarkupContent { kind: lsp::MarkupKind::Markdown, value: markdown })
+}
+
+fn documentation_builtin_function(
+    markdown: &mut String,
+    function: &wgsl_spec::Function,
+) -> Result<(), anyhow::Error> {
+    use std::fmt::Write;
+
+    if let Some(description) = &function.description {
+        writeln!(markdown, "{}", description)?;
+        writeln!(markdown)?;
+    }
+
+    for overload in function.overloads.iter() {
+        if let Some(description) = &overload.description {
+            if !description.trim().is_empty() {
+                for line in description.lines() {
+                    writeln!(markdown, "{}", line)?;
+                }
+            }
+        }
+
+        writeln!(markdown, "```wgsl")?;
+        for (typevar, values) in overload.parameterization.typevars.iter() {
+            write!(markdown, "// ")?;
+            match values {
+                wgsl_spec::ParameterizationKind::Types(types) => {
+                    write!(markdown, "`{typevar}` is ")?;
+                    for (i, typ) in types.iter().enumerate() {
+                        if i != 0 {
+                            if i == types.len() - 1 {
+                                write!(markdown, ", or ")?;
+                            } else {
+                                write!(markdown, ", ")?;
+                            }
+                        }
+
+                        if typ.starts_with("Abstract") {
+                            write!(markdown, "{typ}")?;
+                        } else {
+                            write!(markdown, "`{typ}`")?;
+                        }
+                    }
+                    writeln!(markdown)?;
+                },
+                wgsl_spec::ParameterizationKind::Description(description) => {
+                    writeln!(markdown, "`{typevar}` {description}")?;
+                },
+            }
+        }
+
+        for line in overload.signature.trim().lines() {
+            writeln!(markdown, "{line}")?;
+        }
+        writeln!(markdown, "```")?;
+        writeln!(markdown)?;
+    }
+
+    Ok(())
 }
 
 fn run_server(_arguments: Arguments, connection: lsp_server::Connection) -> Result<()> {
@@ -472,7 +507,7 @@ fn run_server(_arguments: Arguments, connection: lsp_server::Connection) -> Resu
         hover_provider: Some(lsp::HoverProviderCapability::Simple(true)),
         completion_provider: Some(lsp::CompletionOptions {
             resolve_provider: None,
-            trigger_characters: None,
+            trigger_characters: Some(vec![".".into()]),
             all_commit_characters: None,
             work_done_progress_options: Default::default(),
             completion_item: None,
@@ -790,6 +825,30 @@ mod tests {
         assert_serialized_eq(hovers, expected);
     }
 
+    fn check_completions(source: &str, expected: expect_test::Expect) {
+        let client = Client::new();
+
+        let (source, cursors) = document_with_cursors(source);
+        let uri = client.open_document(&source);
+
+        let mut completions = Vec::with_capacity(cursors.len());
+        for cursor in cursors {
+            let completion_info =
+                client.request::<lsp::request::Completion>(lsp::CompletionParams {
+                    work_done_progress_params: Default::default(),
+                    text_document_position: lsp::TextDocumentPositionParams {
+                        text_document: lsp::TextDocumentIdentifier::new(uri.clone()),
+                        position: cursor,
+                    },
+                    partial_result_params: Default::default(),
+                    context: None,
+                });
+            completions.push(completion_info);
+        }
+
+        assert_serialized_eq(completions, expected);
+    }
+
     #[test]
     fn hover() {
         check_hover(
@@ -872,6 +931,273 @@ mod tests {
                       }
                     }
                   }
+                ]
+            "#]],
+        );
+    }
+
+    #[test]
+    fn complete_vec_swizzle_dot() {
+        check_completions(
+            indoc::indoc! {r#"
+                fn main() {
+                    let x = vec2u(1, 2, 3);
+                    x.$
+                }
+            "#},
+            expect![[r#"
+                [
+                  [
+                    {
+                      "label": "x",
+                      "kind": 5,
+                      "documentation": {
+                        "kind": "markdown",
+                        "value": "```wgsl\n: u32\n```\n```wgsl\nu32\n```\n"
+                      }
+                    },
+                    {
+                      "label": "y",
+                      "kind": 5,
+                      "documentation": {
+                        "kind": "markdown",
+                        "value": "```wgsl\n: u32\n```\n```wgsl\nu32\n```\n"
+                      }
+                    },
+                    {
+                      "label": "xx",
+                      "kind": 5,
+                      "documentation": {
+                        "kind": "markdown",
+                        "value": "```wgsl\n: vec2<u32>\n```\n```wgsl\nvec2<u32>\n```\n"
+                      }
+                    },
+                    {
+                      "label": "xy",
+                      "kind": 5,
+                      "documentation": {
+                        "kind": "markdown",
+                        "value": "```wgsl\n: vec2<u32>\n```\n```wgsl\nvec2<u32>\n```\n"
+                      }
+                    },
+                    {
+                      "label": "yx",
+                      "kind": 5,
+                      "documentation": {
+                        "kind": "markdown",
+                        "value": "```wgsl\n: vec2<u32>\n```\n```wgsl\nvec2<u32>\n```\n"
+                      }
+                    },
+                    {
+                      "label": "yy",
+                      "kind": 5,
+                      "documentation": {
+                        "kind": "markdown",
+                        "value": "```wgsl\n: vec2<u32>\n```\n```wgsl\nvec2<u32>\n```\n"
+                      }
+                    },
+                    {
+                      "label": "r",
+                      "kind": 5,
+                      "documentation": {
+                        "kind": "markdown",
+                        "value": "```wgsl\n: u32\n```\n```wgsl\nu32\n```\n"
+                      }
+                    },
+                    {
+                      "label": "g",
+                      "kind": 5,
+                      "documentation": {
+                        "kind": "markdown",
+                        "value": "```wgsl\n: u32\n```\n```wgsl\nu32\n```\n"
+                      }
+                    },
+                    {
+                      "label": "rr",
+                      "kind": 5,
+                      "documentation": {
+                        "kind": "markdown",
+                        "value": "```wgsl\n: vec2<u32>\n```\n```wgsl\nvec2<u32>\n```\n"
+                      }
+                    },
+                    {
+                      "label": "rg",
+                      "kind": 5,
+                      "documentation": {
+                        "kind": "markdown",
+                        "value": "```wgsl\n: vec2<u32>\n```\n```wgsl\nvec2<u32>\n```\n"
+                      }
+                    },
+                    {
+                      "label": "gr",
+                      "kind": 5,
+                      "documentation": {
+                        "kind": "markdown",
+                        "value": "```wgsl\n: vec2<u32>\n```\n```wgsl\nvec2<u32>\n```\n"
+                      }
+                    },
+                    {
+                      "label": "gg",
+                      "kind": 5,
+                      "documentation": {
+                        "kind": "markdown",
+                        "value": "```wgsl\n: vec2<u32>\n```\n```wgsl\nvec2<u32>\n```\n"
+                      }
+                    }
+                  ]
+                ]
+            "#]],
+        );
+    }
+
+    #[test]
+    fn complete_vec_swizzle_field() {
+        check_completions(
+            indoc::indoc! {r#"
+                fn main() {
+                    let x = vec2<u32>(1, 2, 3);
+                    x.$
+                }
+            "#},
+            expect![[r#"
+                [
+                  [
+                    {
+                      "label": "x",
+                      "kind": 5,
+                      "documentation": {
+                        "kind": "markdown",
+                        "value": "```wgsl\n: u32\n```\n```wgsl\nu32\n```\n"
+                      }
+                    },
+                    {
+                      "label": "y",
+                      "kind": 5,
+                      "documentation": {
+                        "kind": "markdown",
+                        "value": "```wgsl\n: u32\n```\n```wgsl\nu32\n```\n"
+                      }
+                    },
+                    {
+                      "label": "xx",
+                      "kind": 5,
+                      "documentation": {
+                        "kind": "markdown",
+                        "value": "```wgsl\n: vec2<u32>\n```\n```wgsl\nvec2<u32>\n```\n"
+                      }
+                    },
+                    {
+                      "label": "xy",
+                      "kind": 5,
+                      "documentation": {
+                        "kind": "markdown",
+                        "value": "```wgsl\n: vec2<u32>\n```\n```wgsl\nvec2<u32>\n```\n"
+                      }
+                    },
+                    {
+                      "label": "yx",
+                      "kind": 5,
+                      "documentation": {
+                        "kind": "markdown",
+                        "value": "```wgsl\n: vec2<u32>\n```\n```wgsl\nvec2<u32>\n```\n"
+                      }
+                    },
+                    {
+                      "label": "yy",
+                      "kind": 5,
+                      "documentation": {
+                        "kind": "markdown",
+                        "value": "```wgsl\n: vec2<u32>\n```\n```wgsl\nvec2<u32>\n```\n"
+                      }
+                    },
+                    {
+                      "label": "r",
+                      "kind": 5,
+                      "documentation": {
+                        "kind": "markdown",
+                        "value": "```wgsl\n: u32\n```\n```wgsl\nu32\n```\n"
+                      }
+                    },
+                    {
+                      "label": "g",
+                      "kind": 5,
+                      "documentation": {
+                        "kind": "markdown",
+                        "value": "```wgsl\n: u32\n```\n```wgsl\nu32\n```\n"
+                      }
+                    },
+                    {
+                      "label": "rr",
+                      "kind": 5,
+                      "documentation": {
+                        "kind": "markdown",
+                        "value": "```wgsl\n: vec2<u32>\n```\n```wgsl\nvec2<u32>\n```\n"
+                      }
+                    },
+                    {
+                      "label": "rg",
+                      "kind": 5,
+                      "documentation": {
+                        "kind": "markdown",
+                        "value": "```wgsl\n: vec2<u32>\n```\n```wgsl\nvec2<u32>\n```\n"
+                      }
+                    },
+                    {
+                      "label": "gr",
+                      "kind": 5,
+                      "documentation": {
+                        "kind": "markdown",
+                        "value": "```wgsl\n: vec2<u32>\n```\n```wgsl\nvec2<u32>\n```\n"
+                      }
+                    },
+                    {
+                      "label": "gg",
+                      "kind": 5,
+                      "documentation": {
+                        "kind": "markdown",
+                        "value": "```wgsl\n: vec2<u32>\n```\n```wgsl\nvec2<u32>\n```\n"
+                      }
+                    }
+                  ]
+                ]
+            "#]],
+        );
+    }
+
+    #[test]
+    fn complete_struct_field() {
+        check_completions(
+            indoc::indoc! {r#"
+                fn main() {
+                    let x = Bar()
+                    x.$
+                }
+
+                struct Bar {
+                    foo: u32,
+                    point: vec2f,
+                }
+            "#},
+            expect![[r#"
+                [
+                  [
+                    {
+                      "label": "foo",
+                      "kind": 5,
+                      "documentation": {
+                        "kind": "markdown",
+                        "value": "```wgsl\n: u32\n```\n```wgsl\nfoo: u32,\n```\n\n"
+                      }
+                    },
+                    {
+                      "label": "point",
+                      "kind": 5,
+                      "documentation": {
+                        "kind": "markdown",
+                        "value": "```wgsl\n: vec2<f32>\n```\n```wgsl\npoint: vec2f,\n```\n\n"
+                      }
+                    }
+                  ]
                 ]
             "#]],
         );

@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     cell::RefCell,
     collections::{BTreeMap, HashMap},
     num::NonZeroU32,
@@ -13,13 +14,13 @@ use crate::{
 static BUILTIN_FUNCTIONS: std::sync::OnceLock<wgsl_spec::FunctionInfo> = std::sync::OnceLock::new();
 static BUILTIN_TOKENS: std::sync::OnceLock<wgsl_spec::TokenInfo> = std::sync::OnceLock::new();
 
-fn get_builtin_functions() -> &'static wgsl_spec::FunctionInfo {
+pub fn get_builtin_functions() -> &'static wgsl_spec::FunctionInfo {
     BUILTIN_FUNCTIONS.get_or_init(|| {
         wgsl_spec::include::functions().expect("could not load builtin function defintitions")
     })
 }
 
-fn get_builtin_tokens() -> &'static wgsl_spec::TokenInfo {
+pub fn get_builtin_tokens() -> &'static wgsl_spec::TokenInfo {
     BUILTIN_TOKENS.get_or_init(|| {
         wgsl_spec::include::tokens().expect("could not load builtin token defintitions")
     })
@@ -93,12 +94,12 @@ pub struct Context<'a> {
     /// At which node we should perform the capture.
     capture_node: Option<parse::NodeIndex>,
     /// The references we captured during name resolution.
-    capture: CaptureSymbols<'a>,
+    capture: RefCell<CaptureSymbols<'a>>,
 }
 
 #[derive(Default)]
 struct CaptureSymbols<'a> {
-    references: Vec<(&'a str, Reference)>,
+    references: Vec<(Cow<'a, str>, Reference)>,
 }
 
 #[derive(Debug, Clone)]
@@ -106,18 +107,14 @@ pub enum Reference {
     User(ReferenceNode),
     BuiltinFunction(&'static wgsl_spec::Function),
     BuiltinTypeAlias(&'static String, &'static String),
-    BuiltinType(Type),
+    BuiltinType(&'static str),
+    Swizzle(u8, Option<TypeScalar>),
 }
 
 impl Reference {
     pub fn name(&self, tree: &parse::Tree) -> Option<syntax::Token!(Identifier)> {
         match self {
             &Reference::User(node) => node.name(tree),
-            Reference::BuiltinType(typ) => match typ {
-                Type::Struct(strukt) => strukt.extract(tree).name,
-                Type::Fn(func) => func.extract(tree).name,
-                _ => None,
-            },
             _ => None,
         }
     }
@@ -303,11 +300,12 @@ impl<'a> Context<'a> {
     }
 
     pub fn get_captured_symbols(&self) -> Vec<ResolvedSymbol> {
-        let mut symbols = Vec::with_capacity(self.capture.references.len());
+        let capture = self.capture.borrow();
+        let mut symbols = Vec::with_capacity(capture.references.len());
 
-        for (name, reference) in self.capture.references.iter() {
+        for (name, reference) in capture.references.iter() {
             symbols.push(ResolvedSymbol {
-                name: (*name).into(),
+                name: name.to_string(),
                 reference: reference.clone(),
                 typ: self.type_of_reference(reference),
             });
@@ -321,33 +319,27 @@ impl<'a> Context<'a> {
         let mut references = Vec::new();
 
         for (name, node) in self.scope.iter_symbols() {
-            references.push((name, Reference::User(node)));
+            references.push((name.into(), Reference::User(node)));
         }
 
         for (name, decl) in self.global_scope.iter() {
-            references.push((name, Reference::User(decl.node)))
+            references.push((name.into(), Reference::User(decl.node)))
         }
 
         for (name, function) in self.builtin_functions.functions.iter() {
-            references.push((name, Reference::BuiltinFunction(function)))
+            references.push((name.into(), Reference::BuiltinFunction(function)))
         }
 
         for (name, original) in self.builtin_tokens.type_aliases.iter() {
-            references.push((name, Reference::BuiltinTypeAlias(name, original)))
+            references.push((name.into(), Reference::BuiltinTypeAlias(name, original)))
         }
 
         for name in self.builtin_tokens.primitive_types.iter() {
-            let Some(typ) = self.parse_type_specifier(name) else {
-                unreachable!("could parse primitive type: {name}")
-            };
-            references.push((name, Reference::BuiltinType(typ)));
+            references.push((name.into(), Reference::BuiltinType(name)));
         }
 
         for name in self.builtin_tokens.type_generators.iter() {
-            let Some(typ) = self.parse_type_specifier(name) else {
-                unreachable!("could parse type generator: {name}")
-            };
-            references.push((name, Reference::BuiltinType(typ)));
+            references.push((name.into(), Reference::BuiltinType(name)));
         }
 
         CaptureSymbols { references }
@@ -355,7 +347,7 @@ impl<'a> Context<'a> {
 
     fn resolve_references(&mut self, index: parse::NodeIndex) {
         if Some(index) == self.capture_node {
-            self.capture = self.capture_symbols();
+            *self.capture.get_mut() = self.capture_symbols();
         }
 
         let node = self.tree.node(index);
@@ -367,6 +359,8 @@ impl<'a> Context<'a> {
                     Reference::User(local)
                 } else if let Some(global) = self.global_scope.get(name) {
                     Reference::User(global.node)
+                } else if let Some(reference) = self.get_builtin_type(name) {
+                    reference
                 } else if let Some(builtin) = self.builtin_functions.functions.get(name) {
                     Reference::BuiltinFunction(builtin)
                 } else if let Some((name, original)) =
@@ -564,13 +558,11 @@ impl<'a> Context<'a> {
             syntax::Expression::Identifier(name) => {
                 self.type_of_reference(self.references.borrow().get(&name.index())?)
             },
-            syntax::Expression::IdentifierWithTemplate(identifier) => self
-                .type_from_specifier(
-                    syntax::TypeSpecifier::IdentifierWithTemplate(identifier),
-                    self.tree,
-                    self.source,
-                )
-                .map(|x| Type::Type(Rc::new(x))),
+            syntax::Expression::IdentifierWithTemplate(identifier) => self.type_from_specifier(
+                syntax::TypeSpecifier::IdentifierWithTemplate(identifier),
+                self.tree,
+                self.source,
+            ),
             syntax::Expression::IntegerDecimal(number) => {
                 match self.source[number.byte_range()].chars().next_back() {
                     Some('u') => Some(Type::Scalar(TypeScalar::U32)),
@@ -615,7 +607,7 @@ impl<'a> Context<'a> {
                 }
 
                 match target_type? {
-                    Type::Type(typ) => Some(Type::clone(&typ)),
+                    Type::Type(inner) => Some(Type::clone(&inner)),
                     Type::Fn(func) => {
                         let data = func.extract(self.tree);
                         let spec = data.output?.extract(self.tree).typ?;
@@ -666,6 +658,52 @@ impl<'a> Context<'a> {
                 let data = expr_member.extract(self.tree);
                 let target_type = self.infer_type_expr_maybe(data.target)?;
 
+                let is_capture = data.member.map(|x| x.index()) == self.capture_node
+                    || data.dot_token.map(|x| x.index()) == self.capture_node;
+                if is_capture {
+                    let mut capture = self.capture.borrow_mut();
+
+                    match target_type {
+                        Type::Vec(count_raw, scalar) => {
+                            let count = count_raw as usize;
+
+                            let mut buffer = [0u8; 4];
+
+                            for alphabet in [b"xyzw", b"rgba"] {
+                                for len in 1..=count {
+                                    for mut rem in 0..count.pow(len as u32) {
+                                        for byte in buffer[0..len].iter_mut().rev() {
+                                            *byte = alphabet[rem % count];
+                                            rem /= count;
+                                        }
+                                        let text = std::str::from_utf8(&buffer[..len]).unwrap();
+                                        capture.references.push((
+                                            Cow::Owned(text.into()),
+                                            Reference::Swizzle(len as u8, scalar),
+                                        ));
+                                    }
+                                }
+                            }
+                        },
+                        Type::Struct(strukt) => {
+                            let data = strukt.extract(self.tree);
+                            if let Some(fields) = data.fields {
+                                for field in fields.fields(self.tree) {
+                                    let data_field = field.extract(self.tree);
+                                    if let Some(name) = data_field.name {
+                                        let text = &self.source[name.byte_range()];
+                                        capture.references.push((
+                                            text.into(),
+                                            Reference::User(ReferenceNode::StructField(field)),
+                                        ));
+                                    }
+                                }
+                            }
+                        },
+                        _ => {},
+                    }
+                }
+
                 let member = data.member?;
                 let member_text = &self.source[member.byte_range()];
 
@@ -676,16 +714,17 @@ impl<'a> Context<'a> {
 
                         let is_xyzw = member_text.bytes().all(|x| xyzw.contains(&x));
                         let is_rgba = member_text.bytes().all(|x| rgba.contains(&x));
-                        if !is_xyzw && !is_rgba {
+                        if !is_xyzw && !is_rgba || member_text.len() > count as usize {
                             self.errors
                                 .borrow_mut()
                                 .push(Error::InvalidMember(expr_member, target_type));
                         }
 
-                        let typ = if count == 1 {
+                        let new_count = member_text.len() as u8;
+                        let typ = if new_count == 1 {
                             scalar.map(Type::Scalar)
                         } else {
-                            Some(Type::Vec(count, scalar))
+                            Some(Type::Vec(new_count, scalar))
                         };
 
                         self.set_inferred_type(member.index(), typ.clone());
@@ -768,8 +807,11 @@ impl<'a> Context<'a> {
                 },
             },
             Reference::BuiltinFunction(_) => None,
-            Reference::BuiltinTypeAlias(_, original) => self.parse_type_specifier(original),
-            Reference::BuiltinType(typ) => Some(Type::Type(Rc::new(typ.clone()))),
+            Reference::BuiltinTypeAlias(_, text) => self.parse_type_specifier(text),
+            Reference::BuiltinType(text) => self.parse_type_specifier(text),
+
+            &Reference::Swizzle(1, scalar) => Some(Type::Scalar(scalar?)),
+            &Reference::Swizzle(count, scalar) => Some(Type::Vec(count, scalar)),
         }
     }
 
@@ -867,7 +909,17 @@ impl<'a> Context<'a> {
 
         if std::ptr::eq(self.tree, tree) {
             if let Some(reference) = self.references.borrow().get(&identifier.index()) {
-                if let Some(typ) = self.type_of_reference(reference) {
+                if let Some(mut typ) = self.type_of_reference(reference) {
+                    let mut specify = |inner: &mut Type| match inner {
+                        Type::Vec(_, s @ None) | Type::Mat(_, _, s @ None) => {
+                            *s = scalar(self, params.next());
+                        },
+                        _ => {},
+                    };
+                    match &mut typ {
+                        Type::Type(inner) => specify(Rc::make_mut(inner)),
+                        _ => specify(&mut typ),
+                    }
                     return Some(typ);
                 }
             }
@@ -946,6 +998,29 @@ impl<'a> Context<'a> {
         };
 
         Some(Type::Type(Rc::new(typ)))
+    }
+
+    fn get_builtin_type(&self, name: &str) -> Option<Reference> {
+        fn search_strings(name: &str, types: &'static [String]) -> Option<&'static str> {
+            match types.binary_search_by(|x| x.as_str().cmp(name)) {
+                Ok(index) => Some(&types[index]),
+                _ => None,
+            }
+        }
+
+        if let Some(typ) = search_strings(name, &self.builtin_tokens.primitive_types) {
+            return Some(Reference::BuiltinType(typ));
+        }
+
+        if let Some(typ) = search_strings(name, &self.builtin_tokens.type_generators) {
+            return Some(Reference::BuiltinType(typ));
+        }
+
+        if let Some((name, original)) = self.builtin_tokens.type_aliases.get_key_value(name) {
+            return Some(Reference::BuiltinTypeAlias(name, original));
+        }
+
+        None
     }
 }
 

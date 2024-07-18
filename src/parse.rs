@@ -475,7 +475,11 @@ impl Tree {
 
             if node.tag.is_token() {
                 let range = node.byte_range();
-                if range.start <= offset && offset <= range.end {
+                let start = match node.tag {
+                    Tag::Identifier | Tag::Dot => range.start,
+                    _ => range.start + 1,
+                };
+                if start <= offset && offset <= range.end {
                     callback(curr as NodeIndex);
                     return true;
                 } else {
