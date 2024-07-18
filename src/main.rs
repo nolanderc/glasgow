@@ -1,4 +1,5 @@
 mod analyze;
+mod format;
 mod parse;
 mod syntax;
 mod test_util;
@@ -275,6 +276,9 @@ fn add_routes(router: &mut Router) {
             });
         }
 
+        // apply edits starting from the end of the file to the beginning.
+        // this way we don't have to recompute ranges as earlier ranges are unaffected by changes
+        // made further down the file.
         document_edits.sort_by(|a, b| b.range.start.cmp(&a.range.start));
 
         #[allow(clippy::mutable_key_type)]
@@ -286,7 +290,17 @@ fn add_routes(router: &mut Router) {
             document_changes: None,
             change_annotations: None,
         }))
-    })
+    });
+
+    router.handle_request::<lsp::request::Formatting>(|state, request| {
+        let document = state.workspace.document(&request.text_document.uri)?;
+        let parsed = document.parse();
+        let formatted = format::format(&parsed.tree, document.content());
+        Ok(Some(vec![lsp::TextEdit {
+            range: document.range_utf16_from_range_utf8(0..document.content().len()).unwrap(),
+            new_text: formatted,
+        }]))
+    });
 }
 
 fn publish_diagnostics_for_document(
@@ -640,6 +654,7 @@ fn run_server(_arguments: Arguments, connection: lsp_server::Connection) -> Resu
         definition_provider: Some(lsp::OneOf::Left(true)),
         rename_provider: Some(lsp::OneOf::Left(true)),
         references_provider: Some(lsp::OneOf::Left(true)),
+        document_formatting_provider: Some(lsp::OneOf::Left(true)),
         ..Default::default()
     };
 

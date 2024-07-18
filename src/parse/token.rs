@@ -174,56 +174,6 @@ impl<'src> Tokenizer<'src> {
     }
 }
 
-fn number_prefix_1_9(source: &str) -> (Tag, usize) {
-    //   [1-9][0-9]*[iu]?
-    //   [1-9][0-9]*[fh]
-    //   [0-9]*\.[0-9]+([eE][+-]?[0-9]+)?[fh]?
-    //   [0-9]+\.[0-9]*([eE][+-]?[0-9]+)?[fh]?
-    //   [0-9]+[eE][+-]?[0-9]+[fh]?
-    let mut i = 1;
-    let mut integer = true;
-
-    let bytes = source.as_bytes();
-
-    while i < bytes.len() && bytes[i].is_ascii_digit() {
-        i += 1;
-    }
-
-    // fraction
-    if matches!(bytes.get(i), Some(b'.')) {
-        i += 1;
-        integer = false;
-        while i < bytes.len() && bytes[i].is_ascii_digit() {
-            i += 1;
-        }
-    }
-
-    // exponent
-    if matches!(bytes.get(i), Some(b'e' | b'E')) {
-        i += 1;
-        integer = false;
-
-        if matches!(bytes.get(i), Some(b'+' | b'-')) {
-            i += 1;
-        }
-
-        while i < bytes.len() && bytes[i].is_ascii_digit() {
-            i += 1;
-        }
-    }
-
-    // type suffix
-    if matches!(bytes.get(i), Some(b'f' | b'h')) {
-        i += 1;
-        integer = false;
-    }
-    if integer && matches!(bytes.get(i), Some(b'i' | b'u')) {
-        i += 1;
-    }
-
-    (if integer { Tag::IntegerDecimal } else { Tag::FloatDecimal }, i)
-}
-
 #[derive(Debug)]
 struct TemplateLists {
     starts: Vec<u32>,
@@ -543,12 +493,58 @@ fn number_prefix_0(source: &str) -> (Tag, usize) {
 
             (if integer { Tag::IntegerHex } else { Tag::FloatHex }, i)
         },
-        _ => match bytes.get(1) {
-            Some(b'i' | b'u') => (Tag::IntegerDecimal, 2),
-            Some(b'f' | b'h') => (Tag::FloatDecimal, 2),
-            _ => (Tag::IntegerDecimal, 1),
-        },
+        _ => number_prefix_1_9(source),
     }
+}
+
+fn number_prefix_1_9(source: &str) -> (Tag, usize) {
+    //   [1-9][0-9]*[iu]?
+    //   [1-9][0-9]*[fh]
+    //   [0-9]*\.[0-9]+([eE][+-]?[0-9]+)?[fh]?
+    //   [0-9]+\.[0-9]*([eE][+-]?[0-9]+)?[fh]?
+    //   [0-9]+[eE][+-]?[0-9]+[fh]?
+    let mut i = 1;
+    let mut integer = true;
+
+    let bytes = source.as_bytes();
+
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+
+    // fraction
+    if matches!(bytes.get(i), Some(b'.')) {
+        i += 1;
+        integer = false;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+    }
+
+    // exponent
+    if matches!(bytes.get(i), Some(b'e' | b'E')) {
+        i += 1;
+        integer = false;
+
+        if matches!(bytes.get(i), Some(b'+' | b'-')) {
+            i += 1;
+        }
+
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+    }
+
+    // type suffix
+    if matches!(bytes.get(i), Some(b'f' | b'h')) {
+        i += 1;
+        integer = false;
+    }
+    if integer && matches!(bytes.get(i), Some(b'i' | b'u')) {
+        i += 1;
+    }
+
+    (if integer { Tag::IntegerDecimal } else { Tag::FloatDecimal }, i)
 }
 
 /// Matches anything that has the general shape of a number: it starts with a digit followed by

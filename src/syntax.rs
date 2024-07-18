@@ -90,7 +90,7 @@ macro_rules! syntax_node_simple {
 }
 
 #[inline(always)]
-fn try_extract<T: SyntaxNodeMatch>(
+pub fn try_extract<T: SyntaxNodeMatch>(
     nodes: &mut std::iter::Peekable<impl Iterator<Item = SyntaxNode>>,
 ) -> Option<T> {
     loop {

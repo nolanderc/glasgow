@@ -228,6 +228,42 @@ impl Tag {
         !self.is_token()
     }
 
+    pub const fn is_number(self) -> bool {
+        matches!(self, Tag::IntegerDecimal | Tag::IntegerHex | Tag::FloatDecimal | Tag::FloatHex)
+    }
+
+    pub const fn is_keyword(self) -> bool {
+        matches!(
+            self,
+            Tag::KeywordAlias
+                | Tag::KeywordBreak
+                | Tag::KeywordCase
+                | Tag::KeywordConst
+                | Tag::KeywordConstAssert
+                | Tag::KeywordContinue
+                | Tag::KeywordContinuing
+                | Tag::KeywordDefault
+                | Tag::KeywordDiagnostic
+                | Tag::KeywordDiscard
+                | Tag::KeywordElse
+                | Tag::KeywordEnable
+                | Tag::KeywordFalse
+                | Tag::KeywordFn
+                | Tag::KeywordFor
+                | Tag::KeywordIf
+                | Tag::KeywordLet
+                | Tag::KeywordLoop
+                | Tag::KeywordOverride
+                | Tag::KeywordRequires
+                | Tag::KeywordReturn
+                | Tag::KeywordStruct
+                | Tag::KeywordSwitch
+                | Tag::KeywordTrue
+                | Tag::KeywordVar
+                | Tag::KeywordWhile
+        )
+    }
+
     pub const fn token_description(self) -> Option<&'static str> {
         Some(match self {
             Tag::Eof => "the end of file",
@@ -338,7 +374,9 @@ impl Node {
         self.tag.is_syntax()
     }
 
-    pub fn children(self) -> impl ExactSizeIterator<Item = NodeIndex> + DoubleEndedIterator {
+    pub fn children(
+        self,
+    ) -> impl ExactSizeIterator<Item = NodeIndex> + DoubleEndedIterator + Clone {
         assert!(self.is_syntax());
         (self.offset..self.offset + self.length.to_u32()).map(NodeIndex)
     }
@@ -378,6 +416,10 @@ impl Tree {
 
     pub fn children(&self, node: Node) -> &[Node] {
         &self.nodes[node.children_range()]
+    }
+
+    pub(crate) fn extra(&self, index: usize) -> Option<Node> {
+        self.extra.get(index).copied()
     }
 
     pub fn root_index(&self) -> NodeIndex {
@@ -613,6 +655,7 @@ impl<'src> Parser<'src> {
         self.stack.clear();
         self.stack.reserve(1024);
 
+        self.output.tree.extra.clear();
         self.output.tree.nodes.clear();
         self.output.tree.nodes.reserve(source.len() / 8);
         self.output.errors.clear();
@@ -1086,7 +1129,7 @@ fn variable_declaration(parser: &mut Parser, mark: OpenMark, tag: Tag) {
     )
 }
 
-const ASSIGNMENT_OP: TokenSet = TokenSet::new(&[
+pub const ASSIGNMENT_OPS: TokenSet = TokenSet::new(&[
     Tag::Equal,
     Tag::LessLessEqual,
     Tag::GreaterGreaterEqual,
@@ -1104,7 +1147,7 @@ fn statement_expression(parser: &mut Parser) {
     let m = parser.open();
     expression(parser);
 
-    if parser.at_any(ASSIGNMENT_OP) {
+    if parser.at_any(ASSIGNMENT_OPS) {
         parser.advance();
         expression(parser);
         parser.expect(Tag::SemiColon);
@@ -1183,7 +1226,7 @@ fn argument_list(parser: &mut Parser) {
     parser.close(m, Tag::ArgumentList);
 }
 
-const EXPRESSION_FIRST: TokenSet = EXPRESSION_PRIMARY_FIRST.union(EXPRESSION_UNARY_OP);
+const EXPRESSION_FIRST: TokenSet = EXPRESSION_PRIMARY_FIRST.union(EXPRESSION_UNARY_OPS);
 
 fn expression(parser: &mut Parser) {
     if !expression_maybe(parser) {
@@ -1199,6 +1242,27 @@ fn expression_maybe(parser: &mut Parser) -> bool {
         false
     }
 }
+
+pub const EXPRESSION_INFIX_OPS: TokenSet = TokenSet::new(&[
+    Tag::Asterisk,
+    Tag::Slash,
+    Tag::Percent,
+    Tag::LessLess,
+    Tag::GreaterGreater,
+    Tag::Chevron,
+    Tag::Ampersand,
+    Tag::Bar,
+    Tag::Plus,
+    Tag::Minus,
+    Tag::Less,
+    Tag::LessEqual,
+    Tag::Greater,
+    Tag::GreaterEqual,
+    Tag::EqualEqual,
+    Tag::ExclamationEqual,
+    Tag::AmpersandAmpersand,
+    Tag::BarBar,
+]);
 
 fn expression_infix(parser: &mut Parser, left_binding_power: u8) {
     // higher binding power means it binds tighter. Multiplication binds tighter than addition.
@@ -1242,14 +1306,14 @@ fn expression_infix(parser: &mut Parser, left_binding_power: u8) {
     }
 }
 
-const EXPRESSION_UNARY_OP: TokenSet =
+const EXPRESSION_UNARY_OPS: TokenSet =
     TokenSet::new(&[Tag::Minus, Tag::Ampersand, Tag::Asterisk, Tag::Exclamation, Tag::Tilde]);
 
 fn expression_prefix(parser: &mut Parser) {
     let m = parser.open();
 
     let mut has_unary = false;
-    while parser.at_any(EXPRESSION_UNARY_OP) {
+    while parser.at_any(EXPRESSION_UNARY_OPS) {
         parser.advance();
         has_unary = true;
     }
