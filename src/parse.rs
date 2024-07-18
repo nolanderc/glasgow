@@ -839,7 +839,7 @@ pub fn parse_file<'parser, 'src>(
 
                         let mark_output = parser.open();
                         if parser.consume(Tag::ThinArrowRight) {
-                            attribute_list_maybe(parser, m);
+                            attribute_list_maybe(parser, mark_output);
                             type_specifier(parser);
                             parser.close(mark_output, Tag::DeclFnOutput);
                         }
