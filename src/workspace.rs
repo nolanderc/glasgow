@@ -246,6 +246,19 @@ impl Document {
         let source = self.content();
         crate::util::fmt_from_fn(move |f| typ.fmt(f, tree, source))
     }
+
+    pub(crate) fn find_all_references(
+        &self,
+        reference: &analyze::Reference,
+    ) -> Vec<crate::parse::NodeIndex> {
+        let parsed = self.parse();
+        let global_scope = &self.global_scope().symbols;
+        let mut context = analyze::Context::new(global_scope, &parsed.tree, &self.content);
+        for decl in crate::syntax::root(&parsed.tree).decls(&parsed.tree) {
+            context.analyze_decl(decl);
+        }
+        context.find_all_references(reference)
+    }
 }
 
 pub type OffsetUtf8 = usize;

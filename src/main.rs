@@ -6,12 +6,12 @@ mod util;
 mod workspace;
 
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     io::{Read, Write as _},
     rc::Rc,
 };
 
-use anyhow::{Context as _, Result};
+use anyhow::{anyhow, Context as _, Result};
 use lsp::{notification::Notification as _, CompletionItemKind};
 
 use crate::syntax::SyntaxNodeMatch;
@@ -130,7 +130,7 @@ fn add_routes(router: &mut Router) {
 
         let parsed = document.parse();
         let range = parsed.tree.node(token).byte_range();
-        let documentation = symbol_documentation(document, &symbol)?;
+        let documentation = symbol_documentation(document, &symbol, true)?;
 
         Ok(Some(lsp::Hover {
             range: document.range_utf16_from_range_utf8(range),
@@ -152,10 +152,14 @@ fn add_routes(router: &mut Router) {
         let mut completions = Vec::with_capacity(symbols.len());
 
         for symbol in symbols {
-            let documentation = symbol_documentation(document, &symbol)?;
+            let documentation = symbol_documentation(document, &symbol, false)?;
             let mut item = lsp::CompletionItem {
                 label: symbol.name,
                 documentation: Some(lsp::Documentation::MarkupContent(documentation)),
+                label_details: symbol.typ.as_ref().map(|typ| lsp::CompletionItemLabelDetails {
+                    detail: Some(format!(": {}", document.format_type(typ))),
+                    ..Default::default()
+                }),
                 ..Default::default()
             };
 
@@ -205,6 +209,84 @@ fn add_routes(router: &mut Router) {
             range: document.range_utf16_from_range_utf8(range).unwrap(),
         })))
     });
+
+    router.handle_request::<lsp::request::References>(|state, request| {
+        let location = request.text_document_position;
+        let document = state.workspace.document(&location.text_document.uri)?;
+        let offset = document
+            .offset_utf8_from_position_utf16(location.position)
+            .context("invalid position")?;
+
+        let Some((symbol, _token)) = document.symbol_at_offset(offset) else {
+            return Ok(None);
+        };
+
+        let parsed = document.parse();
+        let references = document.find_all_references(&symbol.reference);
+
+        let mut locations = Vec::with_capacity(references.len());
+        for reference in references {
+            let Some(range) = parsed.tree.byte_range_total(reference) else { continue };
+            locations.push(lsp::Location {
+                uri: location.text_document.uri.clone(),
+                range: document.range_utf16_from_range_utf8(range).unwrap(),
+            });
+        }
+
+        Ok(Some(locations))
+    });
+
+    router.handle_request::<lsp::request::Rename>(|state, request| {
+        let location = request.text_document_position;
+        let document = state.workspace.document(&location.text_document.uri)?;
+        let offset = document
+            .offset_utf8_from_position_utf16(location.position)
+            .context("invalid position")?;
+
+        let Some((symbol, _token)) = document.symbol_at_offset(offset) else {
+            return Ok(None);
+        };
+
+        match symbol.reference {
+            analyze::Reference::User(_) => {},
+
+            analyze::Reference::BuiltinFunction(_)
+            | analyze::Reference::BuiltinTypeAlias(_, _)
+            | analyze::Reference::BuiltinType(_)
+            | analyze::Reference::Swizzle(_, _) => {
+                return Err(anyhow!("cannot rename builtin functions/types"))
+            },
+        }
+
+        let mut document_edits = Vec::new();
+
+        let references = document.find_all_references(&symbol.reference);
+        let parsed = document.parse();
+
+        for reference in references {
+            let Some(identifier) = <syntax::Token!(Identifier)>::from_tree(&parsed.tree, reference)
+            else {
+                continue;
+            };
+
+            document_edits.push(lsp::TextEdit {
+                range: document.range_utf16_from_range_utf8(identifier.byte_range()).unwrap(),
+                new_text: request.new_name.clone(),
+            });
+        }
+
+        document_edits.sort_by(|a, b| b.range.start.cmp(&a.range.start));
+
+        #[allow(clippy::mutable_key_type)]
+        let mut changes = HashMap::new();
+        changes.insert(location.text_document.uri, document_edits);
+
+        Ok(Some(lsp::WorkspaceEdit {
+            changes: Some(changes),
+            document_changes: None,
+            change_annotations: None,
+        }))
+    })
 }
 
 fn publish_diagnostics_for_document(
@@ -377,15 +459,18 @@ fn collect_diagnostics(state: &State, uri: &lsp::Uri) -> Result<Vec<lsp::Diagnos
 fn symbol_documentation(
     document: &workspace::Document,
     symbol: &analyze::ResolvedSymbol,
+    with_type_info: bool,
 ) -> Result<lsp::MarkupContent> {
     use std::fmt::Write;
 
     let mut markdown = String::new();
 
-    if let Some(typ) = &symbol.typ {
-        writeln!(markdown, "```wgsl")?;
-        writeln!(markdown, ": {}", document.format_type(typ))?;
-        writeln!(markdown, "```")?;
+    if with_type_info {
+        if let Some(typ) = &symbol.typ {
+            writeln!(markdown, "```wgsl")?;
+            writeln!(markdown, ": {}", document.format_type(typ))?;
+            writeln!(markdown, "```")?;
+        }
     }
 
     match &symbol.reference {
@@ -553,6 +638,8 @@ fn run_server(_arguments: Arguments, connection: lsp_server::Connection) -> Resu
             completion_item: None,
         }),
         definition_provider: Some(lsp::OneOf::Left(true)),
+        rename_provider: Some(lsp::OneOf::Left(true)),
+        references_provider: Some(lsp::OneOf::Left(true)),
         ..Default::default()
     };
 
@@ -990,98 +1077,134 @@ mod tests {
                   [
                     {
                       "label": "x",
+                      "labelDetails": {
+                        "detail": ": u32"
+                      },
                       "kind": 5,
                       "documentation": {
                         "kind": "markdown",
-                        "value": "```wgsl\n: u32\n```\n```wgsl\nu32\n```\n"
+                        "value": "```wgsl\nu32\n```\n"
                       }
                     },
                     {
                       "label": "y",
+                      "labelDetails": {
+                        "detail": ": u32"
+                      },
                       "kind": 5,
                       "documentation": {
                         "kind": "markdown",
-                        "value": "```wgsl\n: u32\n```\n```wgsl\nu32\n```\n"
+                        "value": "```wgsl\nu32\n```\n"
                       }
                     },
                     {
                       "label": "xx",
+                      "labelDetails": {
+                        "detail": ": vec2<u32>"
+                      },
                       "kind": 5,
                       "documentation": {
                         "kind": "markdown",
-                        "value": "```wgsl\n: vec2<u32>\n```\n```wgsl\nvec2<u32>\n```\n"
+                        "value": "```wgsl\nvec2<u32>\n```\n"
                       }
                     },
                     {
                       "label": "xy",
+                      "labelDetails": {
+                        "detail": ": vec2<u32>"
+                      },
                       "kind": 5,
                       "documentation": {
                         "kind": "markdown",
-                        "value": "```wgsl\n: vec2<u32>\n```\n```wgsl\nvec2<u32>\n```\n"
+                        "value": "```wgsl\nvec2<u32>\n```\n"
                       }
                     },
                     {
                       "label": "yx",
+                      "labelDetails": {
+                        "detail": ": vec2<u32>"
+                      },
                       "kind": 5,
                       "documentation": {
                         "kind": "markdown",
-                        "value": "```wgsl\n: vec2<u32>\n```\n```wgsl\nvec2<u32>\n```\n"
+                        "value": "```wgsl\nvec2<u32>\n```\n"
                       }
                     },
                     {
                       "label": "yy",
+                      "labelDetails": {
+                        "detail": ": vec2<u32>"
+                      },
                       "kind": 5,
                       "documentation": {
                         "kind": "markdown",
-                        "value": "```wgsl\n: vec2<u32>\n```\n```wgsl\nvec2<u32>\n```\n"
+                        "value": "```wgsl\nvec2<u32>\n```\n"
                       }
                     },
                     {
                       "label": "r",
+                      "labelDetails": {
+                        "detail": ": u32"
+                      },
                       "kind": 5,
                       "documentation": {
                         "kind": "markdown",
-                        "value": "```wgsl\n: u32\n```\n```wgsl\nu32\n```\n"
+                        "value": "```wgsl\nu32\n```\n"
                       }
                     },
                     {
                       "label": "g",
+                      "labelDetails": {
+                        "detail": ": u32"
+                      },
                       "kind": 5,
                       "documentation": {
                         "kind": "markdown",
-                        "value": "```wgsl\n: u32\n```\n```wgsl\nu32\n```\n"
+                        "value": "```wgsl\nu32\n```\n"
                       }
                     },
                     {
                       "label": "rr",
+                      "labelDetails": {
+                        "detail": ": vec2<u32>"
+                      },
                       "kind": 5,
                       "documentation": {
                         "kind": "markdown",
-                        "value": "```wgsl\n: vec2<u32>\n```\n```wgsl\nvec2<u32>\n```\n"
+                        "value": "```wgsl\nvec2<u32>\n```\n"
                       }
                     },
                     {
                       "label": "rg",
+                      "labelDetails": {
+                        "detail": ": vec2<u32>"
+                      },
                       "kind": 5,
                       "documentation": {
                         "kind": "markdown",
-                        "value": "```wgsl\n: vec2<u32>\n```\n```wgsl\nvec2<u32>\n```\n"
+                        "value": "```wgsl\nvec2<u32>\n```\n"
                       }
                     },
                     {
                       "label": "gr",
+                      "labelDetails": {
+                        "detail": ": vec2<u32>"
+                      },
                       "kind": 5,
                       "documentation": {
                         "kind": "markdown",
-                        "value": "```wgsl\n: vec2<u32>\n```\n```wgsl\nvec2<u32>\n```\n"
+                        "value": "```wgsl\nvec2<u32>\n```\n"
                       }
                     },
                     {
                       "label": "gg",
+                      "labelDetails": {
+                        "detail": ": vec2<u32>"
+                      },
                       "kind": 5,
                       "documentation": {
                         "kind": "markdown",
-                        "value": "```wgsl\n: vec2<u32>\n```\n```wgsl\nvec2<u32>\n```\n"
+                        "value": "```wgsl\nvec2<u32>\n```\n"
                       }
                     }
                   ]
@@ -1104,98 +1227,134 @@ mod tests {
                   [
                     {
                       "label": "x",
+                      "labelDetails": {
+                        "detail": ": u32"
+                      },
                       "kind": 5,
                       "documentation": {
                         "kind": "markdown",
-                        "value": "```wgsl\n: u32\n```\n```wgsl\nu32\n```\n"
+                        "value": "```wgsl\nu32\n```\n"
                       }
                     },
                     {
                       "label": "y",
+                      "labelDetails": {
+                        "detail": ": u32"
+                      },
                       "kind": 5,
                       "documentation": {
                         "kind": "markdown",
-                        "value": "```wgsl\n: u32\n```\n```wgsl\nu32\n```\n"
+                        "value": "```wgsl\nu32\n```\n"
                       }
                     },
                     {
                       "label": "xx",
+                      "labelDetails": {
+                        "detail": ": vec2<u32>"
+                      },
                       "kind": 5,
                       "documentation": {
                         "kind": "markdown",
-                        "value": "```wgsl\n: vec2<u32>\n```\n```wgsl\nvec2<u32>\n```\n"
+                        "value": "```wgsl\nvec2<u32>\n```\n"
                       }
                     },
                     {
                       "label": "xy",
+                      "labelDetails": {
+                        "detail": ": vec2<u32>"
+                      },
                       "kind": 5,
                       "documentation": {
                         "kind": "markdown",
-                        "value": "```wgsl\n: vec2<u32>\n```\n```wgsl\nvec2<u32>\n```\n"
+                        "value": "```wgsl\nvec2<u32>\n```\n"
                       }
                     },
                     {
                       "label": "yx",
+                      "labelDetails": {
+                        "detail": ": vec2<u32>"
+                      },
                       "kind": 5,
                       "documentation": {
                         "kind": "markdown",
-                        "value": "```wgsl\n: vec2<u32>\n```\n```wgsl\nvec2<u32>\n```\n"
+                        "value": "```wgsl\nvec2<u32>\n```\n"
                       }
                     },
                     {
                       "label": "yy",
+                      "labelDetails": {
+                        "detail": ": vec2<u32>"
+                      },
                       "kind": 5,
                       "documentation": {
                         "kind": "markdown",
-                        "value": "```wgsl\n: vec2<u32>\n```\n```wgsl\nvec2<u32>\n```\n"
+                        "value": "```wgsl\nvec2<u32>\n```\n"
                       }
                     },
                     {
                       "label": "r",
+                      "labelDetails": {
+                        "detail": ": u32"
+                      },
                       "kind": 5,
                       "documentation": {
                         "kind": "markdown",
-                        "value": "```wgsl\n: u32\n```\n```wgsl\nu32\n```\n"
+                        "value": "```wgsl\nu32\n```\n"
                       }
                     },
                     {
                       "label": "g",
+                      "labelDetails": {
+                        "detail": ": u32"
+                      },
                       "kind": 5,
                       "documentation": {
                         "kind": "markdown",
-                        "value": "```wgsl\n: u32\n```\n```wgsl\nu32\n```\n"
+                        "value": "```wgsl\nu32\n```\n"
                       }
                     },
                     {
                       "label": "rr",
+                      "labelDetails": {
+                        "detail": ": vec2<u32>"
+                      },
                       "kind": 5,
                       "documentation": {
                         "kind": "markdown",
-                        "value": "```wgsl\n: vec2<u32>\n```\n```wgsl\nvec2<u32>\n```\n"
+                        "value": "```wgsl\nvec2<u32>\n```\n"
                       }
                     },
                     {
                       "label": "rg",
+                      "labelDetails": {
+                        "detail": ": vec2<u32>"
+                      },
                       "kind": 5,
                       "documentation": {
                         "kind": "markdown",
-                        "value": "```wgsl\n: vec2<u32>\n```\n```wgsl\nvec2<u32>\n```\n"
+                        "value": "```wgsl\nvec2<u32>\n```\n"
                       }
                     },
                     {
                       "label": "gr",
+                      "labelDetails": {
+                        "detail": ": vec2<u32>"
+                      },
                       "kind": 5,
                       "documentation": {
                         "kind": "markdown",
-                        "value": "```wgsl\n: vec2<u32>\n```\n```wgsl\nvec2<u32>\n```\n"
+                        "value": "```wgsl\nvec2<u32>\n```\n"
                       }
                     },
                     {
                       "label": "gg",
+                      "labelDetails": {
+                        "detail": ": vec2<u32>"
+                      },
                       "kind": 5,
                       "documentation": {
                         "kind": "markdown",
-                        "value": "```wgsl\n: vec2<u32>\n```\n```wgsl\nvec2<u32>\n```\n"
+                        "value": "```wgsl\nvec2<u32>\n```\n"
                       }
                     }
                   ]
@@ -1223,18 +1382,24 @@ mod tests {
                   [
                     {
                       "label": "foo",
+                      "labelDetails": {
+                        "detail": ": u32"
+                      },
                       "kind": 5,
                       "documentation": {
                         "kind": "markdown",
-                        "value": "```wgsl\n: u32\n```\n```wgsl\nfoo: u32,\n```\n\n"
+                        "value": "```wgsl\nfoo: u32,\n```\n\n"
                       }
                     },
                     {
                       "label": "point",
+                      "labelDetails": {
+                        "detail": ": vec2<f32>"
+                      },
                       "kind": 5,
                       "documentation": {
                         "kind": "markdown",
-                        "value": "```wgsl\n: vec2<f32>\n```\n```wgsl\npoint: vec2f,\n```\n\n"
+                        "value": "```wgsl\npoint: vec2f,\n```\n\n"
                       }
                     }
                   ]

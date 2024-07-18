@@ -118,6 +118,18 @@ impl Reference {
             _ => None,
         }
     }
+
+    fn eq(&self, source: &Reference) -> bool {
+        use Reference::*;
+        match (self, source) {
+            (User(lhs), User(rhs)) => lhs.raw().index() == rhs.raw().index(),
+            (&BuiltinFunction(lhs), &BuiltinFunction(rhs)) => std::ptr::eq(lhs, rhs),
+            (&BuiltinTypeAlias(lhs, _), &BuiltinTypeAlias(rhs, _)) => std::ptr::eq(lhs, rhs),
+            (&BuiltinType(lhs), &BuiltinType(rhs)) => std::ptr::eq(lhs, rhs),
+
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -147,6 +159,20 @@ impl From<syntax::Decl> for ReferenceNode {
 }
 
 impl ReferenceNode {
+    pub fn raw(self) -> syntax::SyntaxNode {
+        match self {
+            ReferenceNode::Alias(x) => x.node(),
+            ReferenceNode::Struct(x) => x.node(),
+            ReferenceNode::StructField(x) => x.node(),
+            ReferenceNode::Const(x) => x.node(),
+            ReferenceNode::Override(x) => x.node(),
+            ReferenceNode::Var(x) => x.node(),
+            ReferenceNode::Fn(x) => x.node(),
+            ReferenceNode::FnParameter(x) => x.node(),
+            ReferenceNode::Let(x) => x.node(),
+        }
+    }
+
     pub fn name(self, tree: &parse::Tree) -> Option<syntax::Token!(Identifier)> {
         match self {
             ReferenceNode::Alias(x) => x.extract(tree).name,
@@ -590,37 +616,31 @@ impl<'a> Context<'a> {
                 let data = call.extract(self.tree);
                 let target_type = self.infer_type_expr_maybe(data.target);
 
-                let mut element_count = Some(0);
+                let arguments = |tree: &'a parse::Tree| {
+                    data.arguments.into_iter().flat_map(move |list| {
+                        list.arguments(tree).map(move |x| x.extract(tree).expr)
+                    })
+                };
+
                 let mut element_scalar = None;
-
-                if let Some(arguments) = data.arguments {
-                    for argument in arguments.arguments(self.tree) {
-                        let data_argument = argument.extract(self.tree);
-
-                        let typ = self.infer_type_expr_maybe(data_argument.expr);
-
-                        // TODO: check that the type is valid for the given parameter
-
-                        match typ {
-                            Some(Type::Scalar(scalar)) => {
-                                element_count = element_count.map(|x| x + 1);
-                                element_scalar = TypeScalar::coerce(element_scalar, Some(scalar));
-                            },
-                            Some(Type::Vec(count, scalar)) => {
-                                element_count = element_count.map(|x| x + count as u32);
-                                element_scalar = TypeScalar::coerce(element_scalar, scalar);
-                            },
-                            _ => {
-                                element_count = None;
-                                element_scalar = None;
-                            },
-                        }
+                for argument in arguments(self.tree) {
+                    let typ = self.infer_type_expr_maybe(argument);
+                    match typ {
+                        Some(Type::Scalar(scalar)) => {
+                            element_scalar = TypeScalar::coerce(element_scalar, Some(scalar));
+                        },
+                        Some(Type::Vec(_, scalar)) => {
+                            element_scalar = TypeScalar::coerce(element_scalar, scalar);
+                        },
+                        _ => {
+                            element_scalar = None;
+                        },
                     }
                 }
 
                 match target_type? {
                     Type::Type(inner) => match *inner {
-                        Type::Vec(count, None) => Some(Type::Vec(count, dbg!(element_scalar))),
+                        Type::Vec(count, None) => Some(Type::Vec(count, element_scalar)),
                         Type::Mat(cols, rows, None) => Some(Type::Mat(cols, rows, element_scalar)),
                         _ => Some(Rc::unwrap_or_clone(inner)),
                     },
@@ -1314,6 +1334,18 @@ impl<'a> Context<'a> {
 
         None
     }
+
+    pub(crate) fn find_all_references(&self, source: &Reference) -> Vec<parse::NodeIndex> {
+        let mut result = Vec::new();
+
+        for (index, reference) in self.references.borrow().iter() {
+            if reference.eq(source) {
+                result.push(*index);
+            }
+        }
+
+        result
+    }
 }
 
 struct Scope<'a> {
@@ -1475,7 +1507,7 @@ impl Type {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 match self.0 {
                     Some(inner) => write!(f, "{inner}"),
-                    None => write!(f, "?"),
+                    None => write!(f, "_"),
                 }
             }
         }
@@ -1484,7 +1516,7 @@ impl Type {
             if let Some(typ) = typ {
                 Type::fmt(typ, f, tree, source)
             } else {
-                write!(f, "?")
+                write!(f, "_")
             }
         };
 
