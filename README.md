@@ -39,8 +39,8 @@ Then follow the editor-specific instructions below:
 
 First, install [nvim-lspconfig](https://github.com/neovim/nvim-lspconfig).
 
-As `glasgow` has not yet been included in the default configs `lspconfig`, it
-has to be added it manually:
+As `glasgow` has not yet been included in the default configs, it has to be
+added it manually:
 
 ```lua
 local lspconfig = require 'lspconfig'
