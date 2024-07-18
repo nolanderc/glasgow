@@ -147,20 +147,6 @@ impl From<syntax::Decl> for ReferenceNode {
 }
 
 impl ReferenceNode {
-    pub fn raw(self) -> syntax::SyntaxNode {
-        match self {
-            ReferenceNode::Fn(x) => x.node(),
-            ReferenceNode::Alias(x) => x.node(),
-            ReferenceNode::Struct(x) => x.node(),
-            ReferenceNode::StructField(x) => x.node(),
-            ReferenceNode::Const(x) => x.node(),
-            ReferenceNode::Override(x) => x.node(),
-            ReferenceNode::Var(x) => x.node(),
-            ReferenceNode::FnParameter(x) => x.node(),
-            ReferenceNode::Let(x) => x.node(),
-        }
-    }
-
     pub fn name(self, tree: &parse::Tree) -> Option<syntax::Token!(Identifier)> {
         match self {
             ReferenceNode::Alias(x) => x.extract(tree).name,
@@ -183,6 +169,9 @@ pub enum Error {
     InvalidIndexTarget(syntax::ExprIndex, Type),
     InvalidIndexIndex(syntax::ExprIndex, Type),
     InvalidMember(syntax::ExprMember, Type),
+    InvalidOpUnary(syntax::UnaryOp, Type),
+    InvalidOpInfix(syntax::InfixOp, Type, Type),
+    InvalidCoercion(syntax::SyntaxNode, Type, Type),
 }
 
 #[derive(Debug)]
@@ -211,6 +200,10 @@ impl<'a> Context<'a> {
         context.analyze_signatures_all();
 
         context
+    }
+
+    fn error(&self, error: Error) {
+        self.errors.borrow_mut().push(error);
     }
 
     pub fn analyze_signatures_all(&mut self) {
@@ -368,14 +361,12 @@ impl<'a> Context<'a> {
                 {
                     Reference::BuiltinTypeAlias(name, original)
                 } else {
-                    self.errors.get_mut().push(Error::UnresolvedReference(
-                        ErrorUnresolvedReference {
-                            node: <syntax::Token!(Identifier)>::new(syntax::SyntaxNode::new(
-                                node, index,
-                            ))
-                            .unwrap(),
-                        },
-                    ));
+                    self.error(Error::UnresolvedReference(ErrorUnresolvedReference {
+                        node: <syntax::Token!(Identifier)>::new(syntax::SyntaxNode::new(
+                            node, index,
+                        ))
+                        .unwrap(),
+                    }));
                     return;
                 };
 
@@ -581,14 +572,14 @@ impl<'a> Context<'a> {
                 match self.source[number.byte_range()].chars().next_back() {
                     Some('f') => Some(Type::Scalar(TypeScalar::F32)),
                     Some('h') => Some(Type::Scalar(TypeScalar::F16)),
-                    _ => Some(Type::Scalar(TypeScalar::AbstractInt)),
+                    _ => Some(Type::Scalar(TypeScalar::AbstractFloat)),
                 }
             },
             syntax::Expression::FloatHex(number) => {
                 match self.source[number.byte_range()].chars().next_back() {
                     Some('f') => Some(Type::Scalar(TypeScalar::F32)),
                     Some('h') => Some(Type::Scalar(TypeScalar::F16)),
-                    _ => Some(Type::Scalar(TypeScalar::AbstractInt)),
+                    _ => Some(Type::Scalar(TypeScalar::AbstractFloat)),
                 }
             },
 
@@ -599,22 +590,49 @@ impl<'a> Context<'a> {
                 let data = call.extract(self.tree);
                 let target_type = self.infer_type_expr_maybe(data.target);
 
+                let mut element_count = Some(0);
+                let mut element_scalar = None;
+
                 if let Some(arguments) = data.arguments {
                     for argument in arguments.arguments(self.tree) {
-                        // TODO: check that the type is valid for the given argument
-                        self.infer_type_expr(argument);
+                        let data_argument = argument.extract(self.tree);
+
+                        let typ = self.infer_type_expr_maybe(data_argument.expr);
+
+                        // TODO: check that the type is valid for the given parameter
+
+                        match typ {
+                            Some(Type::Scalar(scalar)) => {
+                                element_count = element_count.map(|x| x + 1);
+                                element_scalar = TypeScalar::coerce(element_scalar, Some(scalar));
+                            },
+                            Some(Type::Vec(count, scalar)) => {
+                                element_count = element_count.map(|x| x + count as u32);
+                                element_scalar = TypeScalar::coerce(element_scalar, scalar);
+                            },
+                            _ => {
+                                element_count = None;
+                                element_scalar = None;
+                            },
+                        }
                     }
                 }
 
                 match target_type? {
-                    Type::Type(inner) => Some(Type::clone(&inner)),
+                    Type::Type(inner) => match *inner {
+                        Type::Vec(count, None) => Some(Type::Vec(count, dbg!(element_scalar))),
+                        Type::Mat(cols, rows, None) => Some(Type::Mat(cols, rows, element_scalar)),
+                        _ => Some(Rc::unwrap_or_clone(inner)),
+                    },
+
                     Type::Fn(func) => {
                         let data = func.extract(self.tree);
                         let spec = data.output?.extract(self.tree).typ?;
                         self.type_from_specifier(spec, self.tree, self.source)
+                            .map(Type::unwrap_inner)
                     },
                     typ => {
-                        self.errors.borrow_mut().push(Error::InvalidCallTarget(call, typ));
+                        self.error(Error::InvalidCallTarget(call, typ));
                         None
                     },
                 }
@@ -631,27 +649,32 @@ impl<'a> Context<'a> {
                 let index_type = self.infer_type_expr_maybe(data.index);
 
                 let target_type = target_type?;
-                let element = match &target_type {
-                    Type::Array(Some(element), _) => Some(element),
-                    Type::Ptr(_, Some(inner), _) => match &**inner {
-                        Type::Array(Some(element), _) => Some(element),
-                        _ => None,
-                    },
-                    _ => None,
-                };
+                let element = match target_type {
+                    Type::Mat(_, _, Some(scalar)) => Type::Scalar(scalar),
+                    Type::Mat(_, _, None) => return None,
 
-                let Some(element) = element else {
-                    self.errors.borrow_mut().push(Error::InvalidIndexTarget(index, target_type));
-                    return None;
+                    Type::Array(Some(element), _) => Rc::unwrap_or_clone(element),
+
+                    Type::Ptr(_, Some(inner), _) => match Rc::unwrap_or_clone(inner) {
+                        Type::Array(Some(element), _) => Rc::unwrap_or_clone(element),
+                        typ => {
+                            self.error(Error::InvalidIndexTarget(index, typ));
+                            return None;
+                        },
+                    },
+                    typ => {
+                        self.error(Error::InvalidIndexTarget(index, typ));
+                        return None;
+                    },
                 };
 
                 if let Some(typ) = index_type {
                     if !matches!(typ, Type::Scalar(TypeScalar::I32 | TypeScalar::U32)) {
-                        self.errors.borrow_mut().push(Error::InvalidIndexIndex(index, typ));
+                        self.error(Error::InvalidIndexIndex(index, typ));
                     }
                 }
 
-                Some(Type::clone(element))
+                Some(element)
             },
 
             syntax::Expression::Member(expr_member) => {
@@ -715,9 +738,7 @@ impl<'a> Context<'a> {
                         let is_xyzw = member_text.bytes().all(|x| xyzw.contains(&x));
                         let is_rgba = member_text.bytes().all(|x| rgba.contains(&x));
                         if !is_xyzw && !is_rgba || member_text.len() > count as usize {
-                            self.errors
-                                .borrow_mut()
-                                .push(Error::InvalidMember(expr_member, target_type));
+                            self.error(Error::InvalidMember(expr_member, target_type));
                         }
 
                         let new_count = member_text.len() as u8;
@@ -753,17 +774,288 @@ impl<'a> Context<'a> {
                             }
                         }
 
-                        self.errors
-                            .borrow_mut()
-                            .push(Error::InvalidMember(expr_member, target_type));
+                        self.error(Error::InvalidMember(expr_member, target_type));
 
                         None
                     },
                     _ => {
-                        self.errors
-                            .borrow_mut()
-                            .push(Error::InvalidMember(expr_member, target_type));
+                        self.error(Error::InvalidMember(expr_member, target_type));
                         None
+                    },
+                }
+            },
+
+            syntax::Expression::Prefix(prefix) => {
+                let mut typ = self.infer_type_expr_maybe(prefix.expr(self.tree))?;
+
+                for op in prefix.ops(self.tree).rev() {
+                    typ = match op {
+                        syntax::UnaryOp::Minus(_) => match typ {
+                            Type::Scalar(scalar) if scalar.is_signed() => typ,
+                            Type::Vec(_, Some(scalar)) if scalar.is_signed() => typ,
+                            Type::Vec(_, None) => typ,
+                            _ => {
+                                self.error(Error::InvalidOpUnary(op, typ));
+                                return None;
+                            },
+                        },
+                        syntax::UnaryOp::Ampersand(_) => Type::Ptr(None, Some(Rc::new(typ)), None),
+                        syntax::UnaryOp::Asterisk(_) => match typ {
+                            Type::Ptr(_, typ, _) => Rc::unwrap_or_clone(typ?),
+                            _ => {
+                                self.error(Error::InvalidOpUnary(op, typ));
+                                return None;
+                            },
+                        },
+                        syntax::UnaryOp::Exclamation(_) => match typ {
+                            Type::Scalar(TypeScalar::Bool) => typ,
+                            Type::Vec(_, Some(TypeScalar::Bool)) => typ,
+                            Type::Vec(count, None) => Type::Vec(count, Some(TypeScalar::Bool)),
+                            _ => {
+                                self.error(Error::InvalidOpUnary(op, typ));
+                                return None;
+                            },
+                        },
+                        syntax::UnaryOp::Tilde(_) => match typ {
+                            Type::Scalar(scalar) if scalar.is_integer() => typ,
+                            Type::Vec(_, Some(scalar)) if scalar.is_integer() => typ,
+                            Type::Vec(_, None) => typ,
+                            _ => {
+                                self.error(Error::InvalidOpUnary(op, typ));
+                                return None;
+                            },
+                        },
+                    };
+                }
+
+                Some(typ)
+            },
+
+            syntax::Expression::Infix(infix) => {
+                let data = infix.extract(self.tree);
+                let lhs_typ = self.infer_type_expr_maybe(data.lhs);
+                let rhs_typ = self.infer_type_expr_maybe(data.rhs);
+
+                let lhs_typ = lhs_typ?;
+                let rhs_typ = rhs_typ?;
+
+                use TypeScalar::*;
+
+                let coerced_scalar = |lhs: Option<TypeScalar>, rhs: Option<TypeScalar>| {
+                    if let Some(scalar) = TypeScalar::coerce(lhs, rhs) {
+                        return Some(scalar);
+                    }
+
+                    if let (Some(lhs), Some(rhs)) = (lhs, rhs) {
+                        self.error(Error::InvalidCoercion(
+                            infix.node(),
+                            Type::Scalar(lhs),
+                            Type::Scalar(rhs),
+                        ));
+                    }
+
+                    None
+                };
+
+                let coerced = |lhs_typ: &Type, rhs_typ: &Type| {
+                    Some(match (lhs_typ, rhs_typ) {
+                        (&Type::Scalar(lhs), &Type::Scalar(rhs)) => {
+                            Type::Scalar(coerced_scalar(Some(lhs), Some(rhs))?)
+                        },
+
+                        (&Type::Vec(lhs_count, lhs_scalar), &Type::Vec(rhs_count, rhs_scalar))
+                            if lhs_count == rhs_count =>
+                        {
+                            Type::Vec(
+                                lhs_count,
+                                match TypeScalar::coerce_abstract(lhs_scalar, rhs_scalar) {
+                                    Some(scalar) => Some(scalar),
+                                    None => {
+                                        self.error(Error::InvalidCoercion(
+                                            infix.node(),
+                                            lhs_typ.clone(),
+                                            rhs_typ.clone(),
+                                        ));
+                                        None
+                                    },
+                                },
+                            )
+                        },
+
+                        (
+                            &Type::Mat(lhs_cols, lhs_rows, lhs_scalar),
+                            &Type::Mat(rhs_cols, rhs_rows, rhs_scalar),
+                        ) if (lhs_cols, lhs_rows) == (rhs_cols, rhs_rows) => Type::Mat(
+                            lhs_cols,
+                            lhs_rows,
+                            match TypeScalar::coerce_abstract(lhs_scalar, rhs_scalar) {
+                                Some(scalar) => Some(scalar),
+                                None => {
+                                    self.error(Error::InvalidCoercion(
+                                        infix.node(),
+                                        lhs_typ.clone(),
+                                        rhs_typ.clone(),
+                                    ));
+                                    None
+                                },
+                            },
+                        ),
+
+                        _ => {
+                            self.error(Error::InvalidCoercion(
+                                infix.node(),
+                                lhs_typ.clone(),
+                                rhs_typ.clone(),
+                            ));
+                            return None;
+                        },
+                    })
+                };
+
+                fn is_arithmetic_maybe(scalar: Option<TypeScalar>) -> bool {
+                    scalar.map(TypeScalar::is_arithmetic).unwrap_or(true)
+                }
+
+                fn is_integer_maybe(scalar: Option<TypeScalar>) -> bool {
+                    scalar.map(TypeScalar::is_integer).unwrap_or(true)
+                }
+
+                let op = data.op?;
+                match op {
+                    syntax::InfixOp::Plus(_)
+                    | syntax::InfixOp::Minus(_)
+                    | syntax::InfixOp::Asterisk(_)
+                    | syntax::InfixOp::Slash(_)
+                    | syntax::InfixOp::Percent(_) => match (&lhs_typ, &rhs_typ) {
+                        (&Type::Scalar(lhs_scalar), &Type::Scalar(rhs_scalar))
+                            if lhs_scalar.is_arithmetic() && rhs_scalar.is_arithmetic() =>
+                        {
+                            Some(Type::Scalar(coerced_scalar(Some(lhs_scalar), Some(rhs_scalar))?))
+                        },
+
+                        (&Type::Scalar(scalar), &Type::Vec(count, vec_scalar))
+                        | (&Type::Vec(count, vec_scalar), &Type::Scalar(scalar))
+                            if scalar.is_arithmetic() && is_arithmetic_maybe(vec_scalar) =>
+                        {
+                            Some(Type::Vec(count, coerced_scalar(Some(scalar), vec_scalar)))
+                        },
+
+                        (&Type::Vec(lhs_count, lhs_scalar), &Type::Vec(rhs_count, rhs_scalar))
+                            if lhs_count == rhs_count
+                                && is_arithmetic_maybe(lhs_scalar)
+                                && is_arithmetic_maybe(rhs_scalar) =>
+                        {
+                            Some(Type::Vec(lhs_count, coerced_scalar(lhs_scalar, rhs_scalar)))
+                        },
+
+                        (&Type::Mat(cols, rows, mat_scalar), &Type::Scalar(scalar))
+                        | (&Type::Scalar(scalar), &Type::Mat(cols, rows, mat_scalar))
+                            if matches!(op, syntax::InfixOp::Asterisk(_))
+                                && scalar.is_arithmetic()
+                                && is_arithmetic_maybe(mat_scalar) =>
+                        {
+                            Some(Type::Mat(cols, rows, coerced_scalar(Some(scalar), mat_scalar)))
+                        },
+
+                        (&Type::Mat(cols, rows, mat_scalar), &Type::Vec(count, vec_scalar))
+                            if matches!(op, syntax::InfixOp::Asterisk(_))
+                                && count == cols
+                                && is_arithmetic_maybe(vec_scalar)
+                                && is_arithmetic_maybe(mat_scalar) =>
+                        {
+                            Some(Type::Vec(rows, coerced_scalar(mat_scalar, mat_scalar)))
+                        },
+
+                        (&Type::Vec(count, vec_scalar), &Type::Mat(cols, rows, mat_scalar))
+                            if matches!(op, syntax::InfixOp::Asterisk(_))
+                                && count == rows
+                                && is_arithmetic_maybe(vec_scalar)
+                                && is_arithmetic_maybe(mat_scalar) =>
+                        {
+                            Some(Type::Vec(cols, coerced_scalar(mat_scalar, mat_scalar)))
+                        },
+
+                        (
+                            &Type::Mat(lhs_cols, lhs_rows, lhs_scalar),
+                            &Type::Mat(rhs_cols, rhs_rows, rhs_scalar),
+                        ) if matches!(
+                            op,
+                            syntax::InfixOp::Plus(_)
+                                | syntax::InfixOp::Minus(_)
+                                | syntax::InfixOp::Asterisk(_)
+                        ) && (lhs_cols, lhs_rows) == (rhs_cols, rhs_rows)
+                            && is_arithmetic_maybe(lhs_scalar)
+                            && is_arithmetic_maybe(rhs_scalar) =>
+                        {
+                            Some(Type::Mat(
+                                lhs_cols,
+                                lhs_rows,
+                                coerced_scalar(lhs_scalar, rhs_scalar),
+                            ))
+                        },
+
+                        _ => {
+                            self.error(Error::InvalidOpInfix(op, lhs_typ, rhs_typ));
+                            None
+                        },
+                    },
+
+                    syntax::InfixOp::LessLess(_) | syntax::InfixOp::GreaterGreater(_) => {
+                        match (lhs_typ, rhs_typ) {
+                            (lhs_typ @ Type::Scalar(lhs), Type::Scalar(U32))
+                                if lhs.is_integer() =>
+                            {
+                                Some(lhs_typ)
+                            },
+
+                            (
+                                lhs_typ @ Type::Vec(lhs_count, lhs),
+                                Type::Vec(rhs_count, None | Some(U32)),
+                            ) if lhs_count == rhs_count && is_integer_maybe(lhs) => Some(lhs_typ),
+
+                            (lhs, rhs) => {
+                                self.error(Error::InvalidOpInfix(op, lhs, rhs));
+                                None
+                            },
+                        }
+                    },
+
+                    syntax::InfixOp::Chevron(_)
+                    | syntax::InfixOp::Ampersand(_)
+                    | syntax::InfixOp::Bar(_) => match coerced(&lhs_typ, &rhs_typ)? {
+                        Type::Scalar(scalar) if scalar.is_integer() => Some(Type::Scalar(scalar)),
+                        Type::Vec(count, Some(scalar)) if scalar.is_integer() => {
+                            Some(Type::Vec(count, Some(scalar)))
+                        },
+                        Type::Vec(count, None) => Some(Type::Vec(count, None)),
+                        _ => {
+                            self.error(Error::InvalidOpInfix(op, lhs_typ, rhs_typ));
+                            None
+                        },
+                    },
+
+                    syntax::InfixOp::Less(_)
+                    | syntax::InfixOp::LessEqual(_)
+                    | syntax::InfixOp::Greater(_)
+                    | syntax::InfixOp::GreaterEqual(_)
+                    | syntax::InfixOp::EqualEqual(_)
+                    | syntax::InfixOp::ExclamationEqual(_) => match coerced(&lhs_typ, &rhs_typ)? {
+                        Type::Scalar(_) => Some(Type::Scalar(Bool)),
+                        Type::Vec(count, _) => Some(Type::Vec(count, Some(Bool))),
+                        _ => {
+                            self.error(Error::InvalidOpInfix(op, lhs_typ, rhs_typ));
+                            None
+                        },
+                    },
+
+                    syntax::InfixOp::AmpersandAmpersand(_) | syntax::InfixOp::BarBar(_) => {
+                        match coerced(&lhs_typ, &rhs_typ)? {
+                            Type::Scalar(Bool) => Some(Type::Scalar(Bool)),
+                            _ => {
+                                self.error(Error::InvalidOpInfix(op, lhs_typ, rhs_typ));
+                                None
+                            },
+                        }
                     },
                 }
             },
@@ -1166,7 +1458,7 @@ pub enum Type {
 impl Type {
     pub fn unwrap_inner(self) -> Type {
         match self {
-            Type::Type(inner) => Type::clone(&inner),
+            Type::Type(inner) => Rc::unwrap_or_clone(inner),
             _ => self,
         }
     }
@@ -1276,7 +1568,7 @@ impl Type {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TypeScalar {
     I32,
     U32,
@@ -1285,6 +1577,97 @@ pub enum TypeScalar {
     Bool,
     AbstractInt,
     AbstractFloat,
+}
+
+impl TypeScalar {
+    fn is_signed(self) -> bool {
+        matches!(
+            self,
+            TypeScalar::I32
+                | TypeScalar::F32
+                | TypeScalar::F16
+                | TypeScalar::AbstractInt
+                | TypeScalar::AbstractFloat
+        )
+    }
+
+    fn is_integer(self) -> bool {
+        matches!(self, TypeScalar::I32 | TypeScalar::U32 | TypeScalar::AbstractInt)
+    }
+
+    fn coerce_abstract(
+        lhs_scalar: Option<TypeScalar>,
+        rhs_scalar: Option<TypeScalar>,
+    ) -> Option<TypeScalar> {
+        use TypeScalar::*;
+        match (lhs_scalar, rhs_scalar) {
+            (None, _) => rhs_scalar,
+            (_, None) => lhs_scalar,
+            (Some(lhs), Some(rhs)) if lhs == rhs => lhs_scalar,
+            (Some(lhs), Some(rhs)) => match (lhs, rhs) {
+                (AbstractInt, I32 | U32 | F32 | F16 | AbstractFloat) => Some(rhs),
+                (I32 | U32 | F32 | F16 | AbstractFloat, AbstractInt) => Some(lhs),
+                (AbstractFloat, F32 | F16) => Some(rhs),
+                (F32 | F16, AbstractFloat) => Some(lhs),
+                _ => None,
+            },
+        }
+    }
+
+    fn coerce(lhs: Option<TypeScalar>, rhs: Option<TypeScalar>) -> Option<TypeScalar> {
+        let (lhs, rhs) = match (lhs, rhs) {
+            (None, _) => return rhs,
+            (_, None) => return lhs,
+            (Some(lhs), Some(rhs)) => (lhs, rhs),
+        };
+
+        use TypeScalar::*;
+        Some(match (lhs, rhs) {
+            (I32, I32) => lhs,
+            (I32, AbstractInt) => lhs,
+
+            (U32, U32) => lhs,
+            (U32, AbstractInt) => lhs,
+
+            (F32, F32) => lhs,
+            (F32, F16) => lhs,
+            (F32, AbstractInt) => lhs,
+            (F32, AbstractFloat) => lhs,
+
+            (F16, F32) => rhs,
+            (F16, F16) => lhs,
+            (F16, AbstractInt) => lhs,
+            (F16, AbstractFloat) => lhs,
+
+            (Bool, Bool) => lhs,
+
+            (AbstractInt, I32) => rhs,
+            (AbstractInt, U32) => rhs,
+            (AbstractInt, F32) => rhs,
+            (AbstractInt, F16) => rhs,
+            (AbstractInt, AbstractInt) => rhs,
+            (AbstractInt, AbstractFloat) => rhs,
+
+            (AbstractFloat, F32) => rhs,
+            (AbstractFloat, F16) => rhs,
+            (AbstractFloat, AbstractInt) => lhs,
+            (AbstractFloat, AbstractFloat) => lhs,
+
+            _ => return None,
+        })
+    }
+
+    fn is_arithmetic(self) -> bool {
+        match self {
+            TypeScalar::Bool => false,
+            TypeScalar::I32 => true,
+            TypeScalar::U32 => true,
+            TypeScalar::F32 => true,
+            TypeScalar::F16 => true,
+            TypeScalar::AbstractInt => true,
+            TypeScalar::AbstractFloat => true,
+        }
+    }
 }
 
 impl std::fmt::Display for TypeScalar {

@@ -36,11 +36,11 @@ pub trait SyntaxNodeMatch: Sized {
     fn node(self) -> SyntaxNode;
 
     fn parse_node(self) -> parse::Node {
-        self.node().parse
+        self.node().parse_node()
     }
 
     fn index(self) -> parse::NodeIndex {
-        self.node().index
+        self.node().index()
     }
 
     fn from_tree(tree: &Tree, index: parse::NodeIndex) -> Option<Self> {
@@ -174,7 +174,7 @@ pub fn root(tree: &Tree) -> Root {
 syntax_node_simple!(Root);
 
 impl Root {
-    pub fn decls(self, tree: &Tree) -> impl Iterator<Item = Decl> + '_ {
+    pub fn decls(self, tree: &Tree) -> impl DoubleEndedIterator<Item = Decl> + '_ {
         self.node().children(tree).filter_map(Decl::new)
     }
 }
@@ -189,18 +189,6 @@ syntax_node_enum!(
         Fn(DeclFn),
     }
 );
-impl Decl {
-    pub fn name(self, tree: &Tree) -> Option<Token!(Identifier)> {
-        match self {
-            Decl::Alias(alias) => alias.extract(tree).name,
-            Decl::Struct(strukt) => strukt.extract(tree).name,
-            Decl::Const(konst) => konst.extract(tree).name,
-            Decl::Override(overide) => overide.extract(tree).name,
-            Decl::Var(war) => war.extract(tree).name,
-            Decl::Fn(func) => func.extract(tree).name,
-        }
-    }
-}
 
 syntax_node_simple!(
     DeclAlias,
@@ -227,7 +215,7 @@ syntax_node_simple!(
 syntax_node_simple!(DeclStructFieldList);
 
 impl DeclStructFieldList {
-    pub fn fields(self, tree: &Tree) -> impl Iterator<Item = DeclStructField> + '_ {
+    pub fn fields(self, tree: &Tree) -> impl DoubleEndedIterator<Item = DeclStructField> + '_ {
         self.0.children(tree).filter_map(DeclStructField::new)
     }
 }
@@ -325,7 +313,7 @@ syntax_node_enum!(
 
 syntax_node_simple!(StmtBlock);
 impl StmtBlock {
-    pub fn statements(self, tree: &Tree) -> impl Iterator<Item = Statement> + '_ {
+    pub fn statements(self, tree: &Tree) -> impl DoubleEndedIterator<Item = Statement> + '_ {
         self.0.children(tree).filter_map(Statement::new)
     }
 }
@@ -365,6 +353,62 @@ syntax_node_enum!(
         Parens(ExprParens),
         Index(ExprIndex),
         Member(ExprMember),
+        Prefix(ExprPrefix),
+        Infix(ExprInfix),
+    }
+);
+
+syntax_node_simple!(
+    ExprInfix,
+    struct ExprInfixData {
+        lhs: Expression,
+        op: InfixOp,
+        rhs: Expression,
+    }
+);
+
+syntax_node_enum!(
+    enum InfixOp {
+        Asterisk(Token!(Asterisk)),
+        Slash(Token!(Slash)),
+        Percent(Token!(Percent)),
+        LessLess(Token!(LessLess)),
+        GreaterGreater(Token!(GreaterGreater)),
+        Chevron(Token!(Chevron)),
+        Ampersand(Token!(Ampersand)),
+        Bar(Token!(Bar)),
+        Plus(Token!(Plus)),
+        Minus(Token!(Minus)),
+        Less(Token!(Less)),
+        LessEqual(Token!(LessEqual)),
+        Greater(Token!(Greater)),
+        GreaterEqual(Token!(GreaterEqual)),
+        EqualEqual(Token!(EqualEqual)),
+        ExclamationEqual(Token!(ExclamationEqual)),
+        AmpersandAmpersand(Token!(AmpersandAmpersand)),
+        BarBar(Token!(BarBar)),
+    }
+);
+
+syntax_node_simple!(ExprPrefix);
+
+impl ExprPrefix {
+    pub fn ops(self, tree: &Tree) -> impl DoubleEndedIterator<Item = UnaryOp> + '_ {
+        self.0.children(tree).filter_map(UnaryOp::new)
+    }
+
+    pub fn expr(self, tree: &Tree) -> Option<Expression> {
+        self.0.children(tree).next_back().and_then(Expression::new)
+    }
+}
+
+syntax_node_enum!(
+    enum UnaryOp {
+        Minus(Token!(Minus)),
+        Ampersand(Token!(Ampersand)),
+        Asterisk(Token!(Asterisk)),
+        Exclamation(Token!(Exclamation)),
+        Tilde(Token!(Tilde)),
     }
 );
 
@@ -379,10 +423,18 @@ syntax_node_simple!(
 syntax_node_simple!(ArgumentList);
 
 impl ArgumentList {
-    pub fn arguments(self, tree: &Tree) -> impl Iterator<Item = Expression> + '_ {
-        self.0.children(tree).filter_map(Expression::new)
+    pub fn arguments(self, tree: &Tree) -> impl DoubleEndedIterator<Item = Argument> + '_ {
+        self.0.children(tree).filter_map(Argument::new)
     }
 }
+
+syntax_node_simple!(
+    Argument,
+    struct ArgumentData {
+        expr: Expression,
+        comma: Token!(Comma),
+    }
+);
 
 syntax_node_simple!(
     ExprParens,
@@ -428,7 +480,10 @@ syntax_node_simple!(
 syntax_node_simple!(TemplateList);
 
 impl TemplateList {
-    pub fn parameters(self, tree: &Tree) -> impl Iterator<Item = TemplateParameter> + '_ {
+    pub fn parameters(
+        self,
+        tree: &Tree,
+    ) -> impl DoubleEndedIterator<Item = TemplateParameter> + '_ {
         self.0.children(tree).filter_map(TemplateParameter::new)
     }
 }

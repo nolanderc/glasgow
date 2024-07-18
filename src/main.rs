@@ -327,6 +327,46 @@ fn collect_diagnostics(state: &State, uri: &lsp::Uri) -> Result<Vec<lsp::Diagnos
                         ..Default::default()
                     });
                 },
+                analyze::Error::InvalidOpUnary(op, typ) => {
+                    let range = op.parse_node().byte_range();
+                    diagnostics.push(lsp::Diagnostic {
+                        range: document.range_utf16_from_range_utf8(range.clone()).unwrap(),
+                        severity: Some(lsp::DiagnosticSeverity::ERROR),
+                        message: format!(
+                            "cannot apply operator `{}` to type `{}`",
+                            &document.content()[range],
+                            document.format_type(typ)
+                        ),
+                        ..Default::default()
+                    });
+                },
+                analyze::Error::InvalidOpInfix(op, lhs, rhs) => {
+                    let range = op.parse_node().byte_range();
+                    diagnostics.push(lsp::Diagnostic {
+                        range: document.range_utf16_from_range_utf8(range.clone()).unwrap(),
+                        severity: Some(lsp::DiagnosticSeverity::ERROR),
+                        message: format!(
+                            "cannot apply operator {} to types `{}` and `{}`",
+                            &document.content()[range],
+                            document.format_type(lhs),
+                            document.format_type(rhs),
+                        ),
+                        ..Default::default()
+                    });
+                },
+                analyze::Error::InvalidCoercion(node, lhs, rhs) => {
+                    let Some(range) = parsed.tree.byte_range_total(node.index()) else { continue };
+                    diagnostics.push(lsp::Diagnostic {
+                        range: document.range_utf16_from_range_utf8(range.clone()).unwrap(),
+                        severity: Some(lsp::DiagnosticSeverity::ERROR),
+                        message: format!(
+                            "incompatible types `{}` and `{}`",
+                            document.format_type(lhs),
+                            document.format_type(rhs),
+                        ),
+                        ..Default::default()
+                    });
+                },
             }
         }
     }
