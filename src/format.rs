@@ -193,6 +193,7 @@ impl<'a> Formatter<'a> {
                 Tag::ThinArrowRight,
                 Tag::LCurly,
                 Tag::AtSign,
+                Tag::KeywordElse,
             ])
         };
 
@@ -204,13 +205,10 @@ impl<'a> Formatter<'a> {
                 .with_many(&[Tag::Identifier, Tag::ThinArrowRight, Tag::Comma, Tag::Colon])
         };
 
-        let never_space_before = const {
+        const NEVER_SPACE_BEFORE_TERMINATORS: TokenSet = const {
             TokenSet::new(&[
-                Tag::LParen,
                 Tag::RParen,
-                Tag::LBracket,
                 Tag::RBracket,
-                Tag::TemplateListStart,
                 Tag::TemplateListEnd,
                 Tag::Dot,
                 Tag::Comma,
@@ -218,6 +216,13 @@ impl<'a> Formatter<'a> {
                 Tag::SemiColon,
                 Tag::PlusPlus,
                 Tag::MinusMinus,
+            ])
+        };
+        let never_space_before = const {
+            NEVER_SPACE_BEFORE_TERMINATORS.with_many(&[
+                Tag::LParen,
+                Tag::LBracket,
+                Tag::TemplateListStart,
             ])
         };
 
@@ -242,8 +247,12 @@ impl<'a> Formatter<'a> {
         };
 
         let exception = || match (self.previous_token, node.tag()) {
-            (Tag::KeywordVar, Tag::TemplateListStart) => false,
-            (keyword, Tag::SemiColon) if keyword.is_keyword() => false,
+            (keyword, Tag::TemplateListStart) if keyword.is_keyword() => false,
+            (keyword, after)
+                if keyword.is_keyword() && NEVER_SPACE_BEFORE_TERMINATORS.contains(after) =>
+            {
+                false
+            },
             (keyword, _) if keyword.is_keyword() => true,
             _ => false,
         };
@@ -412,7 +421,16 @@ mod tests {
                     let y = vec2<f32>(123, 456);
 
                     // single-line blocks should be allowed
-                    if (1 + 1 == 2) { return vec4(); } 
+                    if (1 + 1 == 2) { return vec4(); } else { return vec4(1.0); }
+
+                    // multi-line if-else-statement
+                    if (1 + 1 == 2) {
+                        return vec4();
+                    } else if (false) {
+                        return vec4(0.5);
+                    } else {
+                        return vec4(1.0);
+                    }
                 }
 
                 struct Uniforms {
@@ -473,7 +491,16 @@ mod tests {
                     let y = vec2<f32>(123, 456);
 
                     // single-line blocks should be allowed
-                    if (1 + 1 == 2) { return vec4(); }
+                    if (1 + 1 == 2) { return vec4(); } else { return vec4(1.0); }
+
+                    // multi-line if-else-statement
+                    if (1 + 1 == 2) {
+                        return vec4();
+                    } else if (false) {
+                        return vec4(0.5);
+                    } else {
+                        return vec4(1.0);
+                    }
                 }
 
                 struct Uniforms {
