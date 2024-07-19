@@ -208,17 +208,28 @@ impl<'a> Formatter<'a> {
             TokenSet::new(&[
                 Tag::LParen,
                 Tag::RParen,
+                Tag::LBracket,
+                Tag::RBracket,
                 Tag::TemplateListStart,
                 Tag::TemplateListEnd,
                 Tag::Dot,
                 Tag::Comma,
                 Tag::Colon,
                 Tag::SemiColon,
+                Tag::PlusPlus,
+                Tag::MinusMinus,
             ])
         };
 
-        let never_space_after =
-            const { TokenSet::new(&[Tag::LParen, Tag::TemplateListStart, Tag::Dot, Tag::AtSign]) };
+        let never_space_after = const {
+            TokenSet::new(&[
+                Tag::LParen,
+                Tag::LBracket,
+                Tag::TemplateListStart,
+                Tag::Dot,
+                Tag::AtSign,
+            ])
+        };
 
         let never = || {
             never_space_before.contains(node.tag())
@@ -421,7 +432,7 @@ mod tests {
                         for (i = 2; i < 28; i += 3) {
                             while i < 3 {
                                 if i == 2 {
-                                    break;
+                                    return arr[i];
                                 }
                             }
                         }
@@ -481,11 +492,11 @@ mod tests {
                 var<uniform> uniforms: Uniforms;
 
                 fn loops() {
-                    for (var i = 0; i < 10; i ++) {
+                    for (var i = 0; i < 10; i++) {
                         for (i = 2; i < 28; i += 3) {
                             while i < 3 {
                                 if i == 2 {
-                                    break;
+                                    return arr[i];
                                 }
                             }
                         }
