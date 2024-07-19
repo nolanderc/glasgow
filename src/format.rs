@@ -163,9 +163,8 @@ impl<'a> Formatter<'a> {
             items.next_back();
         }
 
-        let multiline = if let Some(byte_range) = self.tree.byte_range_total_children(items.clone())
-        {
-            self.source[byte_range].ends_with(',')
+        let multiline = if let Some(range) = self.tree.byte_range_total_children(items.clone()) {
+            self.source[range].ends_with(',')
         } else {
             false
         };
@@ -398,7 +397,7 @@ mod tests {
                          * lines, but the stars should
                          * still be aligned :-) */
 
-                    let y = vec2<f32>(123,456);
+                    let y = vec2<f32>(123, 456);
 
                     // single-line blocks should be allowed
                     if (1 + 1 == 2) { return vec4(); } 
@@ -443,9 +442,10 @@ mod tests {
 
                     /* this comment is
                      * split across multiple
-                     * lines :-) */
+                     * lines, but the stars should
+                     * still be aligned :-) */
 
-                    let y = 123;
+                    let y = vec2<f32>(123, 456);
 
                     // single-line blocks should be allowed
                     if (1 + 1 == 2) { return vec4(); }
@@ -461,6 +461,9 @@ mod tests {
                         1234,
                     >,
                 }
+
+                @group(0) @binding(0)
+                var<uniform> uniforms: Uniforms;
             "#]],
         )
     }
