@@ -18,6 +18,7 @@ use lsp::{notification::Notification as _, CompletionItemKind};
 use crate::syntax::SyntaxNodeMatch;
 
 #[derive(Debug, clap::Parser)]
+#[clap(version, author, about)]
 struct Arguments {
     #[clap(subcommand)]
     communication: Option<Communication>,

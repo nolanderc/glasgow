@@ -2,6 +2,7 @@
 name = "glasgow"
 version = "0.1.1"
 edition = "2021"
+authors = ["Christofer Nolander <christofer@nolander.me>"]
 description = "Language Server for WGSL (WebGPU Shading Language)"
 repository = "https://github.com/nolanderc/glasgow"
 license-file = "LICENSE"
