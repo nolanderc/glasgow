@@ -188,23 +188,24 @@ impl<'a> Formatter<'a> {
     }
 
     fn emit_token(&mut self, node: parse::Node) {
-        let range = node.byte_range();
-
         let always_space_before = const {
-            parse::EXPRESSION_INFIX_OPS
-                .union(parse::ASSIGNMENT_OPS)
-                .with_many(&[Tag::ThinArrowRight, Tag::LCurly])
-        };
-
-        let always_space_after = const {
             parse::EXPRESSION_INFIX_OPS.union(parse::ASSIGNMENT_OPS).with_many(&[
+                Tag::Identifier,
                 Tag::ThinArrowRight,
-                Tag::Comma,
-                Tag::Colon,
+                Tag::LCurly,
+                Tag::AtSign,
             ])
         };
 
-        let never_space = const {
+        let always_space_after = const {
+            parse::EXPRESSION_INFIX_OPS
+                .union(parse::ASSIGNMENT_OPS)
+                .union(Tag::NUMBERS)
+                .union(Tag::KEYWORDS)
+                .with_many(&[Tag::Identifier, Tag::ThinArrowRight, Tag::Comma, Tag::Colon])
+        };
+
+        let never_space_before = const {
             TokenSet::new(&[
                 Tag::LParen,
                 Tag::RParen,
@@ -217,17 +218,30 @@ impl<'a> Formatter<'a> {
             ])
         };
 
-        if !never_space.contains(node.tag())
-            && (self.previous_token == Tag::Identifier
-                || self.previous_token.is_number()
+        let never_space_after =
+            const { TokenSet::new(&[Tag::LParen, Tag::TemplateListStart, Tag::Dot, Tag::AtSign]) };
+
+        let never = || {
+            never_space_before.contains(node.tag())
+                || never_space_after.contains(self.previous_token)
+        };
+
+        let always = || {
+            always_space_before.contains(node.tag())
                 || always_space_after.contains(self.previous_token)
-                || always_space_before.contains(node.tag()))
-            || self.previous_token.is_keyword()
-        {
+        };
+
+        let exception = || match (self.previous_token, node.tag()) {
+            (Tag::KeywordVar, Tag::TemplateListStart) => false,
+            (keyword, _) if keyword.is_keyword() => true,
+            _ => false,
+        };
+
+        if (!never() && always()) || exception() {
             self.emit_space();
         }
 
-        self.emit_range(range, 0);
+        self.emit_range(node.byte_range(), 0);
 
         self.previous_token = node.tag();
     }
@@ -381,9 +395,10 @@ mod tests {
 
                         /* this comment is
                          * split across multiple
-                         * lines :-) */
+                         * lines, but the stars should
+                         * still be aligned :-) */
 
-                    let y = 123;
+                    let y = vec2<f32>(123,456);
 
                     // single-line blocks should be allowed
                     if (1 + 1 == 2) { return vec4(); } 
@@ -397,7 +412,8 @@ mod tests {
                     complex_array: array<vec2<f32>, 1234,>
                 }
 
-                const foo = 123;
+                @group(0) @binding(0)
+                var<uniform> uniforms: Uniforms;
             "#},
             expect![[r#"
                 // this file contains a bunch of various syntax constructs
@@ -445,8 +461,6 @@ mod tests {
                         1234,
                     >,
                 }
-
-                const foo = 123;
             "#]],
         )
     }

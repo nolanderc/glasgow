@@ -228,40 +228,40 @@ impl Tag {
         !self.is_token()
     }
 
-    pub const fn is_number(self) -> bool {
-        matches!(self, Tag::IntegerDecimal | Tag::IntegerHex | Tag::FloatDecimal | Tag::FloatHex)
-    }
+    pub const NUMBERS: TokenSet =
+        TokenSet::new(&[Tag::IntegerDecimal, Tag::IntegerHex, Tag::FloatDecimal, Tag::FloatHex]);
+
+    pub const KEYWORDS: TokenSet = TokenSet::new(&[
+        Tag::KeywordAlias,
+        Tag::KeywordBreak,
+        Tag::KeywordCase,
+        Tag::KeywordConst,
+        Tag::KeywordConstAssert,
+        Tag::KeywordContinue,
+        Tag::KeywordContinuing,
+        Tag::KeywordDefault,
+        Tag::KeywordDiagnostic,
+        Tag::KeywordDiscard,
+        Tag::KeywordElse,
+        Tag::KeywordEnable,
+        Tag::KeywordFalse,
+        Tag::KeywordFn,
+        Tag::KeywordFor,
+        Tag::KeywordIf,
+        Tag::KeywordLet,
+        Tag::KeywordLoop,
+        Tag::KeywordOverride,
+        Tag::KeywordRequires,
+        Tag::KeywordReturn,
+        Tag::KeywordStruct,
+        Tag::KeywordSwitch,
+        Tag::KeywordTrue,
+        Tag::KeywordVar,
+        Tag::KeywordWhile,
+    ]);
 
     pub const fn is_keyword(self) -> bool {
-        matches!(
-            self,
-            Tag::KeywordAlias
-                | Tag::KeywordBreak
-                | Tag::KeywordCase
-                | Tag::KeywordConst
-                | Tag::KeywordConstAssert
-                | Tag::KeywordContinue
-                | Tag::KeywordContinuing
-                | Tag::KeywordDefault
-                | Tag::KeywordDiagnostic
-                | Tag::KeywordDiscard
-                | Tag::KeywordElse
-                | Tag::KeywordEnable
-                | Tag::KeywordFalse
-                | Tag::KeywordFn
-                | Tag::KeywordFor
-                | Tag::KeywordIf
-                | Tag::KeywordLet
-                | Tag::KeywordLoop
-                | Tag::KeywordOverride
-                | Tag::KeywordRequires
-                | Tag::KeywordReturn
-                | Tag::KeywordStruct
-                | Tag::KeywordSwitch
-                | Tag::KeywordTrue
-                | Tag::KeywordVar
-                | Tag::KeywordWhile
-        )
+        Self::KEYWORDS.contains(self)
     }
 
     pub const fn token_description(self) -> Option<&'static str> {
