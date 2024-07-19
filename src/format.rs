@@ -58,7 +58,7 @@ impl<'a> Formatter<'a> {
             Tag::Root => {
                 for child in node.children() {
                     self.emit_node(child);
-                    self.emit_newlines(1, 2);
+                    self.emit_newlines(1, 3);
                 }
             },
 
@@ -232,6 +232,7 @@ impl<'a> Formatter<'a> {
 
         let exception = || match (self.previous_token, node.tag()) {
             (Tag::KeywordVar, Tag::TemplateListStart) => false,
+            (keyword, Tag::SemiColon) if keyword.is_keyword() => false,
             (keyword, _) if keyword.is_keyword() => true,
             _ => false,
         };
@@ -411,8 +412,21 @@ mod tests {
                     complex_array: array<vec2<f32>, 1234,>
                 }
 
+
                 @group(0) @binding(0)
                 var<uniform> uniforms: Uniforms;
+
+                fn loops() {
+                    for (var i = 0; i < 10; i++) {
+                        for (i = 2; i < 28; i += 3) {
+                            while i < 3 {
+                                if i == 2 {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
             "#},
             expect![[r#"
                 // this file contains a bunch of various syntax constructs
@@ -462,8 +476,21 @@ mod tests {
                     >,
                 }
 
+
                 @group(0) @binding(0)
                 var<uniform> uniforms: Uniforms;
+
+                fn loops() {
+                    for (var i = 0; i < 10; i ++) {
+                        for (i = 2; i < 28; i += 3) {
+                            while i < 3 {
+                                if i == 2 {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
             "#]],
         )
     }

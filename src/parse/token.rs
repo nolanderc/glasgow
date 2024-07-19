@@ -142,6 +142,7 @@ impl<'src> Tokenizer<'src> {
             b'.' => (Tag::Dot, 1),
             b'+' => match bytes.get(1) {
                 Some(b'+') => (Tag::PlusPlus, 2),
+                Some(b'=') => (Tag::PlusEqual, 2),
                 _ => (Tag::Plus, 1),
             },
             b'|' => match bytes.get(1) {

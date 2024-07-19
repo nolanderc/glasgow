@@ -906,6 +906,7 @@ const STATEMENT_FIRST: TokenSet = EXPRESSION_FIRST.with_many(&[
     Tag::KeywordConst,
     Tag::KeywordFn,
     Tag::KeywordIf,
+    Tag::KeywordFor,
     Tag::KeywordLoop,
     Tag::KeywordWhile,
     Tag::KeywordSwitch,
@@ -967,7 +968,7 @@ fn statement(parser: &mut Parser) {
 
         Tag::SemiColon => parser.advance(),
 
-        _ if parser.at_any(EXPRESSION_FIRST) => statement_expression(parser),
+        _ if parser.at_any(EXPRESSION_FIRST) => statement_expression(parser, true),
 
         _ => {
             let m = parser.open();
@@ -986,12 +987,15 @@ fn statement(parser: &mut Parser) {
                                 let m = parser.open();
                                 variable_declaration(parser, m, tag)
                             },
-                            _ if parser.at_any(EXPRESSION_FIRST) => statement_expression(parser),
+                            _ if parser.at_any(EXPRESSION_FIRST) => {
+                                statement_expression(parser, true)
+                            },
+                            Tag::SemiColon => parser.advance(),
                             _ => parser.emit_error(Expected::Statement),
                         }
                         expression(parser);
                         parser.expect(Tag::SemiColon);
-                        statement_expression(parser);
+                        statement_expression(parser, false);
                         parser.expect(Tag::RParen);
                     }
 
@@ -1125,25 +1129,33 @@ pub const ASSIGNMENT_OPS: TokenSet = TokenSet::new(&[
     Tag::BarEqual,
 ]);
 
-fn statement_expression(parser: &mut Parser) {
+fn statement_expression(parser: &mut Parser, semi: bool) {
     let m = parser.open();
     expression(parser);
 
     if parser.at_any(ASSIGNMENT_OPS) {
         parser.advance();
         expression(parser);
-        parser.expect(Tag::SemiColon);
+        if semi {
+            parser.expect(Tag::SemiColon);
+        }
         parser.close(m, Tag::StmtAssign);
     } else if parser.at(Tag::PlusPlus) {
         parser.advance();
-        parser.expect(Tag::SemiColon);
+        if semi {
+            parser.expect(Tag::SemiColon);
+        }
         parser.close(m, Tag::StmtIncrement);
     } else if parser.at(Tag::MinusMinus) {
         parser.advance();
-        parser.expect(Tag::SemiColon);
+        if semi {
+            parser.expect(Tag::SemiColon);
+        }
         parser.close(m, Tag::StmtDecrement);
     } else {
-        parser.expect(Tag::SemiColon);
+        if semi {
+            parser.expect(Tag::SemiColon);
+        }
         parser.close(m, Tag::StmtExpr);
     }
 }
@@ -1581,5 +1593,96 @@ mod tests {
                         RCurly "}"
             "#]],
         );
+    }
+
+    #[test]
+    fn for_loop() {
+        check(
+            indoc::indoc! {r#"
+                fn foo() -> i32 {
+                    for (var i = 0i; i < 10; i += 1) {
+                        if i == 8 {
+                            return i;
+                        }
+                    }
+
+                    var i = 0i;
+                    for (; i < 10; i++) {}
+                }
+            "#},
+            expect![[r#"
+                Root
+                  DeclFn
+                    KeywordFn "fn"
+                    Identifier "foo"
+                    DeclFnParameterList
+                      LParen "("
+                      RParen ")"
+                    DeclFnOutput
+                      ThinArrowRight "->"
+                      Identifier "i32"
+                    StmtBlock
+                      LCurly "{"
+                      StmtFor
+                        KeywordFor "for"
+                        LParen "("
+                        DeclVar
+                          KeywordVar "var"
+                          Identifier "i"
+                          Equal "="
+                          IntegerDecimal "0i"
+                          SemiColon ";"
+                        ExprInfix
+                          Identifier "i"
+                          Less "<"
+                          IntegerDecimal "10"
+                        SemiColon ";"
+                        StmtAssign
+                          Identifier "i"
+                          PlusEqual "+="
+                          IntegerDecimal "1"
+                        RParen ")"
+                        StmtBlock
+                          LCurly "{"
+                          StmtIf
+                            StmtIfBranch
+                              KeywordIf "if"
+                              ExprInfix
+                                Identifier "i"
+                                EqualEqual "=="
+                                IntegerDecimal "8"
+                              StmtBlock
+                                LCurly "{"
+                                StmtReturn
+                                  KeywordReturn "return"
+                                  Identifier "i"
+                                  SemiColon ";"
+                                RCurly "}"
+                          RCurly "}"
+                      DeclVar
+                        KeywordVar "var"
+                        Identifier "i"
+                        Equal "="
+                        IntegerDecimal "0i"
+                        SemiColon ";"
+                      StmtFor
+                        KeywordFor "for"
+                        LParen "("
+                        SemiColon ";"
+                        ExprInfix
+                          Identifier "i"
+                          Less "<"
+                          IntegerDecimal "10"
+                        SemiColon ";"
+                        StmtIncrement
+                          Identifier "i"
+                          PlusPlus "++"
+                        RParen ")"
+                        StmtBlock
+                          LCurly "{"
+                          RCurly "}"
+                      RCurly "}"
+            "#]],
+        )
     }
 }
