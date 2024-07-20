@@ -19,11 +19,21 @@ struct Formatter<'a> {
     source: &'a str,
     tree: &'a parse::Tree,
     output: String,
+
+    state: State,
+}
+
+#[derive(Clone)]
+struct State {
     previous_token: Tag,
     next_extra: usize,
     last_emit: usize,
 
+    /// If set to `true`, the next token emitted will not have any leading space inserted.
+    force_no_space_before: bool,
+
     indent: usize,
+    indent_base: usize,
     needs_indent: bool,
 }
 
@@ -33,26 +43,30 @@ impl<'a> Formatter<'a> {
             source,
             tree,
             output: String::new(),
-            previous_token: Tag::Eof,
-            next_extra: 0,
-            last_emit: 0,
-            indent: 0,
-            needs_indent: false,
+            state: State {
+                previous_token: Tag::Eof,
+                next_extra: 0,
+                last_emit: 0,
+                force_no_space_before: true,
+                indent: 0,
+                indent_base: 0,
+                needs_indent: false,
+            },
         }
     }
 
     fn indent_decrease(&mut self) {
-        self.indent = self.indent.saturating_sub(4);
+        self.state.indent = self.state.indent.saturating_sub(4);
     }
 
     fn indent_increase(&mut self) {
-        self.indent = self.indent.saturating_add(4);
+        self.state.indent = self.state.indent.saturating_add(4);
     }
 
     fn emit_node(&mut self, index: parse::NodeIndex) {
         let node = self.tree.node(index);
 
-        let indent_before = self.indent;
+        let indent_before = self.state.indent;
 
         match node.tag() {
             Tag::Root => {
@@ -81,7 +95,10 @@ impl<'a> Formatter<'a> {
                         }
                     }
 
+                    let base_old =
+                        std::mem::replace(&mut self.state.indent_base, self.state.indent);
                     self.emit_node(child);
+                    self.state.indent_base = base_old;
 
                     if i == 0 {
                         self.indent_increase();
@@ -132,6 +149,29 @@ impl<'a> Formatter<'a> {
                 }
             },
 
+            Tag::ExprPrefix => {
+                for (i, child) in node.children().enumerate() {
+                    if i != 0 {
+                        self.state.force_no_space_before = true;
+                    }
+                    self.emit_node(child);
+                }
+                self.state.force_no_space_before = false;
+            },
+
+            Tag::ExprInfix => {
+                for child in node.children() {
+                    let node = self.tree.node(child);
+                    if node.is_token()
+                        && parse::EXPRESSION_INFIX_OPS.contains(node.tag())
+                        && self.emit_newlines(0, 1) != 0
+                    {
+                        self.state.indent = self.state.indent_base + 4;
+                    }
+                    self.emit_node(child);
+                }
+            },
+
             tag if tag.is_token() => self.emit_token(node),
             _ => {
                 for child in node.children() {
@@ -144,7 +184,7 @@ impl<'a> Formatter<'a> {
             self.emit_space_or_newlines(1);
         }
 
-        self.indent = indent_before;
+        self.state.indent = indent_before;
     }
 
     fn emit_list_comma_separated(&mut self, node: parse::Node, open_tag: Tag, close_tag: Tag) {
@@ -163,26 +203,92 @@ impl<'a> Formatter<'a> {
             items.next_back();
         }
 
-        let multiline = if let Some(range) = self.tree.byte_range_total_children(items.clone()) {
-            self.source[range].ends_with(',')
-        } else {
-            false
+        let mut multiline = false;
+        let mut multicolumn = false;
+
+        if let Some(range) = self.tree.byte_range_total_children(items.clone()) {
+            multiline = self.source[range.clone()].ends_with(',');
+            multicolumn = self.source[range].contains('\n');
         };
 
-        for (i, child) in node.children().enumerate() {
-            if i == count - 1 && self.tree.node(child).tag() == close_tag {
-                self.indent_decrease();
+        let state = self.state.clone();
+        let output_len = self.output.len();
+        let mut column_sizes = Vec::with_capacity(8);
+        let mut retries = 1;
+
+        'outer: loop {
+            let mut column = 0;
+            let mut aligned = true;
+            let mut padding = 0;
+
+            for (i, child) in node.children().enumerate() {
+                let node = self.tree.node(child);
+
+                if node.tag() == close_tag {
+                    if multiline {
+                        self.indent_decrease();
+                    }
+                    self.emit_token(node);
+                } else if node.tag() == open_tag {
+                    self.emit_token(node);
+                    if multiline {
+                        self.indent_increase();
+                    }
+                } else {
+                    self.output.extend(std::iter::repeat(' ').take(padding));
+
+                    let len_before = self.output.len();
+                    self.emit_node(child);
+                    let len_after = self.output.len();
+
+                    if multiline && multicolumn {
+                        let inner = &self.output[len_before..len_after];
+                        if inner.contains('\n') {
+                            multicolumn = false;
+                            self.state = state.clone();
+                            self.output.truncate(output_len);
+                            continue 'outer;
+                        }
+
+                        let size = inner.trim().len();
+                        if column >= column_sizes.len() {
+                            column_sizes.push(size);
+                        } else if size > column_sizes[column] {
+                            column_sizes[column] = size;
+                            aligned = false;
+                        } else {
+                            padding = column_sizes[column] - size + 1;
+                        }
+                        column += 1;
+                    }
+                }
+
+                if multiline && i < count - 1 {
+                    let newline_min = if multicolumn { 0 } else { 1 };
+                    if self.emit_newlines(newline_min, 1) != 0 {
+                        column = 0;
+                        padding = 0;
+                    }
+                }
             }
 
-            self.emit_node(child);
+            if multiline && multicolumn {
+                if aligned {
+                    break;
+                }
 
-            if i == 0 {
-                self.indent_increase();
+                if retries == 0 {
+                    multicolumn = false;
+                } else {
+                    retries -= 1;
+                }
+                self.state = state.clone();
+                self.output.truncate(output_len);
+
+                continue;
             }
 
-            if multiline && i < count - 1 {
-                self.emit_newlines(1, 1);
-            }
+            break;
         }
     }
 
@@ -238,15 +344,15 @@ impl<'a> Formatter<'a> {
 
         let never = || {
             never_space_before.contains(node.tag())
-                || never_space_after.contains(self.previous_token)
+                || never_space_after.contains(self.state.previous_token)
         };
 
         let always = || {
             always_space_before.contains(node.tag())
-                || always_space_after.contains(self.previous_token)
+                || always_space_after.contains(self.state.previous_token)
         };
 
-        let exception = || match (self.previous_token, node.tag()) {
+        let exception = || match (self.state.previous_token, node.tag()) {
             (keyword, Tag::TemplateListStart) if keyword.is_keyword() => false,
             (keyword, after)
                 if keyword.is_keyword() && NEVER_SPACE_BEFORE_TERMINATORS.contains(after) =>
@@ -257,22 +363,24 @@ impl<'a> Formatter<'a> {
             _ => false,
         };
 
-        if (!never() && always()) || exception() {
+        if self.state.force_no_space_before {
+            self.state.force_no_space_before = false;
+        } else if (!never() && always()) || exception() {
             self.emit_space();
         }
 
         self.emit_range(node.byte_range(), 0);
 
-        self.previous_token = node.tag();
+        self.state.previous_token = node.tag();
     }
 
     fn emit_comments_before(&mut self, offset: usize, max_lines_after: usize) -> Option<usize> {
         let mut lines = None;
 
-        while let Some(extra) = self.tree.extra(self.next_extra) {
+        while let Some(extra) = self.tree.extra(self.state.next_extra) {
             let extra_range = extra.byte_range();
             if extra_range.start < offset {
-                self.next_extra += 1;
+                self.state.next_extra += 1;
                 self.emit_space_or_newlines(2);
 
                 let line_start =
@@ -291,7 +399,7 @@ impl<'a> Formatter<'a> {
     fn emit_range(&mut self, range: std::ops::Range<usize>, ignore_leading_whitespace: usize) {
         self.emit_comments_before(range.start, 2);
 
-        self.last_emit = range.end;
+        self.state.last_emit = range.end;
         let mut text = &self.source[range];
 
         let trim_leading_whitespace = |line: &'a str| {
@@ -314,11 +422,11 @@ impl<'a> Formatter<'a> {
             return;
         }
 
-        if self.needs_indent {
-            for _ in 0..self.indent {
+        if self.state.needs_indent {
+            for _ in 0..self.state.indent {
                 self.output.push(' ');
             }
-            self.needs_indent = false;
+            self.state.needs_indent = false;
         }
 
         self.output += text;
@@ -333,16 +441,16 @@ impl<'a> Formatter<'a> {
     }
 
     fn emit_newlines(&mut self, min: usize, max: usize) -> usize {
-        let remainder = &self.source[self.last_emit..];
+        let remainder = &self.source[self.state.last_emit..];
         let trimmed = remainder.trim_start();
         let whitespace = &remainder[..remainder.len() - trimmed.len()];
         let mut count = whitespace.chars().filter(|x| *x == '\n').count();
 
-        self.last_emit += whitespace.len();
+        self.state.last_emit += whitespace.len();
 
         let mut emitted = 0;
         if count == 0 && min != 0 {
-            if let Some(lines_after) = self.emit_comments_before(self.last_emit + 1, max) {
+            if let Some(lines_after) = self.emit_comments_before(self.state.last_emit + 1, max) {
                 emitted = lines_after;
             }
         }
@@ -369,7 +477,7 @@ impl<'a> Formatter<'a> {
             self.output.pop();
         }
         self.output += "\n";
-        self.needs_indent = true;
+        self.state.needs_indent = true;
     }
 }
 
@@ -456,6 +564,13 @@ mod tests {
                         }
                     }
                 }
+
+                // we should preserve line breaks in math
+                const x = 1 + 2
+                    + 4
+                    + 8 / some_call_to_a_multiline_function(1, 2, 3,)
+                    + 15 * -4
+                    - 14;
             "#},
             expect![[r#"
                 // this file contains a bunch of various syntax constructs
@@ -528,6 +643,93 @@ mod tests {
                             }
                         }
                     }
+                }
+
+                // we should preserve line breaks in math
+                const x = 1 + 2
+                    + 4
+                    + 8 / some_call_to_a_multiline_function(
+                        1,
+                        2,
+                        3,
+                    )
+                    + 15 * -4
+                    - 14;
+            "#]],
+        )
+    }
+
+    #[test]
+    fn wrapping() {
+        check_formatting(
+            indoc! {r#"
+                fn main() {
+                    let wrap_none = mat2x2(1,2,3,4);
+                    let wrap_auto = mat2x2(1,2,3,4,);
+                    let wrap_keep = mat2x2(
+                        1,2,
+                        3,4,
+                    );
+                }
+            "#},
+            expect![[r#"
+                fn main() {
+                    let wrap_none = mat2x2(1, 2, 3, 4);
+                    let wrap_auto = mat2x2(
+                        1,
+                        2,
+                        3,
+                        4,
+                    );
+                    let wrap_keep = mat2x2(
+                        1, 2,
+                        3, 4,
+                    );
+                }
+            "#]],
+        )
+    }
+
+    #[test]
+    fn alignment() {
+        check_formatting(
+            indoc! {r#"
+                fn main() {
+                    let align_simple = mat2x2(
+                        123,4,5,
+                        6,78,90,
+                    );
+                    let align_keep_complex = mat2x2(
+                        1,vec2(a,b),2,
+                        3456,78,90,
+                    );
+                    let align_skip_complex = mat2x2(
+                        123,vec2(a,b,),4,
+                        6,78,90,
+                    );
+                }
+            "#},
+            expect![[r#"
+                fn main() {
+                    let align_simple = mat2x2(
+                        123, 4,  5,
+                        6,   78, 90,
+                    );
+                    let align_keep_complex = mat2x2(
+                        1,    vec2(a, b), 2,
+                        3456, 78,         90,
+                    );
+                    let align_skip_complex = mat2x2(
+                        123,
+                        vec2(
+                            a,
+                            b,
+                        ),
+                        4,
+                        6,
+                        78,
+                        90,
+                    );
                 }
             "#]],
         )

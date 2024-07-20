@@ -328,8 +328,8 @@ impl TemplateLists {
         }
 
         starts.sort_unstable();
-        assert!(starts.windows(2).all(|x| x[0] < x[1]));
-        assert!(ends.windows(2).all(|x| x[0] < x[1]));
+        debug_assert!(starts.windows(2).all(|x| x[0] < x[1]));
+        debug_assert!(ends.windows(2).all(|x| x[0] < x[1]));
 
         TemplateLists { starts, ends }
     }
@@ -649,7 +649,7 @@ impl TokenSet {
     }
 
     const fn mask(token: Tag) -> u128 {
-        assert!(token.is_token() && (token as u8) < 128);
+        debug_assert!(token.is_token() && (token as u8) < 128);
         1u128 << token as u8
     }
 }
