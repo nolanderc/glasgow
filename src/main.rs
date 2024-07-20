@@ -27,15 +27,18 @@ struct Arguments {
 #[derive(Debug, clap::Subcommand)]
 enum Communication {
     /// Communicate over stdin and stdout.
+    #[clap(name = "--stdio")]
     Stdio,
 
     /// Communicate over a TCP socket.
+    #[clap(name = "--socket")]
     Socket(CommunicationSocket),
 
     /// Proxy stdin and stdout to a language server listening for a TCP socket.
     ///
     /// This is intended to be used during development as it means we can both get output logs in
     /// another terminal from the editor, and recompile and run a new version of the LSP easier.
+    #[clap(name = "--proxy")]
     Proxy {
         #[clap(long, default_value = "127.0.0.1")]
         addr: std::net::IpAddr,
