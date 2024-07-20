@@ -15,7 +15,7 @@ serde_json = "1.0.120"
 wgsl-spec = { version = "0.2.0", path = "../wgsl-spec", features = ["include"] }
 serde = "1.0.204"
 tracing = "0.1.40"
-tracing-subscriber = "0.3.18"
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 anyhow = { version = "1.0.86", features = ["backtrace"] }
 
 [dev-dependencies]

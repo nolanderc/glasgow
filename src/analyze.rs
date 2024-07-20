@@ -1,6 +1,5 @@
 use std::{
     borrow::Cow,
-    cell::RefCell,
     collections::{BTreeMap, HashMap},
     num::NonZeroU32,
     rc::Rc,
@@ -82,17 +81,17 @@ pub struct Context<'a> {
 
     scope: Scope<'a>,
 
-    errors: RefCell<Vec<Error>>,
+    errors: Vec<Error>,
 
     /// Set to  `true` only if we are within a `@builtin` attribute.
     /// Used to resolve context-dependent attribute names.
     within_attribute_builtin: bool,
 
     /// identifiers which have had their reference resolved.
-    references: RefCell<HashMap<parse::NodeIndex, Reference>>,
+    references: HashMap<parse::NodeIndex, Reference>,
 
     /// The inferred type for each syntax node.
-    types: RefCell<HashMap<parse::NodeIndex, Option<Type>>>,
+    types: HashMap<parse::NodeIndex, Option<Type>>,
 
     /// If set, we should record a capture of the visible symbols during name resolution.
     /// At which node we should perform the capture.
@@ -100,7 +99,7 @@ pub struct Context<'a> {
     /// What to capture.
     capture_options: CaptureOptions,
     /// The references we captured during name resolution.
-    capture: RefCell<CaptureSymbols<'a>>,
+    capture: CaptureSymbols<'a>,
 }
 
 #[derive(Debug, Default)]
@@ -114,7 +113,7 @@ struct CaptureSymbols<'a> {
     references: Vec<(Cow<'a, str>, Reference)>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub enum Reference {
     User(ReferenceNode),
     BuiltinFunction(&'static wgsl_spec::Function),
@@ -152,25 +151,27 @@ impl Reference {
 #[derive(Debug, Clone, Copy)]
 pub enum ReferenceNode {
     Alias(syntax::DeclAlias),
-    Struct(syntax::DeclStruct),
-    StructField(syntax::DeclStructField),
     Const(syntax::DeclConst),
-    Override(syntax::DeclOverride),
-    Var(syntax::DeclVar),
+    ConstAssert(syntax::DeclConstAssert),
     Fn(syntax::DeclFn),
     FnParameter(syntax::DeclFnParameter),
     Let(syntax::StmtLet),
+    Override(syntax::DeclOverride),
+    Struct(syntax::DeclStruct),
+    StructField(syntax::DeclStructField),
+    Var(syntax::DeclVar),
 }
 
 impl From<syntax::Decl> for ReferenceNode {
     fn from(decl: syntax::Decl) -> ReferenceNode {
         match decl {
             syntax::Decl::Alias(x) => ReferenceNode::Alias(x),
-            syntax::Decl::Struct(x) => ReferenceNode::Struct(x),
             syntax::Decl::Const(x) => ReferenceNode::Const(x),
-            syntax::Decl::Override(x) => ReferenceNode::Override(x),
-            syntax::Decl::Var(x) => ReferenceNode::Var(x),
+            syntax::Decl::ConstAssert(x) => ReferenceNode::ConstAssert(x),
             syntax::Decl::Fn(x) => ReferenceNode::Fn(x),
+            syntax::Decl::Override(x) => ReferenceNode::Override(x),
+            syntax::Decl::Struct(x) => ReferenceNode::Struct(x),
+            syntax::Decl::Var(x) => ReferenceNode::Var(x),
         }
     }
 }
@@ -179,28 +180,30 @@ impl ReferenceNode {
     pub fn raw(self) -> syntax::SyntaxNode {
         match self {
             ReferenceNode::Alias(x) => x.node(),
-            ReferenceNode::Struct(x) => x.node(),
-            ReferenceNode::StructField(x) => x.node(),
             ReferenceNode::Const(x) => x.node(),
-            ReferenceNode::Override(x) => x.node(),
-            ReferenceNode::Var(x) => x.node(),
+            ReferenceNode::ConstAssert(x) => x.node(),
             ReferenceNode::Fn(x) => x.node(),
             ReferenceNode::FnParameter(x) => x.node(),
             ReferenceNode::Let(x) => x.node(),
+            ReferenceNode::Override(x) => x.node(),
+            ReferenceNode::Struct(x) => x.node(),
+            ReferenceNode::StructField(x) => x.node(),
+            ReferenceNode::Var(x) => x.node(),
         }
     }
 
     pub fn name(self, tree: &parse::Tree) -> Option<syntax::Token!(Identifier)> {
         match self {
             ReferenceNode::Alias(x) => x.extract(tree).name,
-            ReferenceNode::Struct(x) => x.extract(tree).name,
-            ReferenceNode::StructField(x) => x.extract(tree).name,
             ReferenceNode::Const(x) => x.extract(tree).name,
-            ReferenceNode::Override(x) => x.extract(tree).name,
-            ReferenceNode::Var(x) => x.extract(tree).name,
+            ReferenceNode::ConstAssert(_) => None,
             ReferenceNode::Fn(x) => x.extract(tree).name,
             ReferenceNode::FnParameter(x) => x.extract(tree).name,
             ReferenceNode::Let(x) => x.extract(tree).name,
+            ReferenceNode::Override(x) => x.extract(tree).name,
+            ReferenceNode::Struct(x) => x.extract(tree).name,
+            ReferenceNode::StructField(x) => x.extract(tree).name,
+            ReferenceNode::Var(x) => x.extract(tree).name,
         }
     }
 }
@@ -249,8 +252,8 @@ impl<'a> Context<'a> {
         context
     }
 
-    fn error(&self, error: Error) {
-        self.errors.borrow_mut().push(error);
+    fn error(&mut self, error: Error) {
+        self.errors.push(error);
     }
 
     pub fn analyze_signatures_all(&mut self) {
@@ -284,6 +287,7 @@ impl<'a> Context<'a> {
             syntax::Decl::Alias(_)
             | syntax::Decl::Struct(_)
             | syntax::Decl::Const(_)
+            | syntax::Decl::ConstAssert(_)
             | syntax::Decl::Override(_)
             | syntax::Decl::Var(_) => {
                 let scope_top_level = self.scope.begin();
@@ -302,6 +306,10 @@ impl<'a> Context<'a> {
         match decl {
             syntax::Decl::Alias(_) => {},
             syntax::Decl::Struct(_) => {},
+            syntax::Decl::ConstAssert(assert) => {
+                let data = assert.extract(self.tree);
+                self.infer_type_expr_maybe(data.expr);
+            },
             syntax::Decl::Const(konst) => {
                 let data = konst.extract(self.tree);
                 self.check_variable_decl_types(data.typ, data.value);
@@ -322,12 +330,12 @@ impl<'a> Context<'a> {
             },
         }
 
-        self.errors.get_mut()
+        &mut self.errors
     }
 
-    pub fn get_node_symbol(&self, node: parse::NodeIndex) -> Option<ResolvedSymbol> {
-        let reference = self.references.borrow().get(&node)?.clone();
-        let typ = self.get_inferred_type(node).or_else(|| self.type_of_reference(&reference));
+    pub fn get_node_symbol(&mut self, node: parse::NodeIndex) -> Option<ResolvedSymbol> {
+        let reference = *self.references.get(&node)?;
+        let typ = self.get_inferred_type(node).or_else(|| self.type_of_reference(reference));
         Some(ResolvedSymbol {
             name: self.source[self.tree.node(node).byte_range()].into(),
             reference,
@@ -340,10 +348,8 @@ impl<'a> Context<'a> {
         self.capture_options = options;
     }
 
-    pub fn get_captured_symbols(&self) -> Vec<ResolvedSymbol> {
-        let capture = self.capture.borrow();
-
-        let mut count = capture.references.len();
+    pub fn get_captured_symbols(&mut self) -> Vec<ResolvedSymbol> {
+        let mut count = self.capture.references.len();
 
         if self.capture_options.attributes {
             count += self.builtin_tokens.attributes.len();
@@ -388,13 +394,24 @@ impl<'a> Context<'a> {
             }
         }
 
-        for (name, reference) in capture.references.iter() {
-            symbols.push(ResolvedSymbol {
-                name: name.to_string(),
-                reference: reference.clone(),
-                typ: self.type_of_reference(reference),
-            });
+        let mut capture = std::mem::take(&mut self.capture);
+
+        loop {
+            for (name, reference) in capture.references.iter() {
+                symbols.push(ResolvedSymbol {
+                    name: name.to_string(),
+                    reference: *reference,
+                    typ: self.type_of_reference(*reference),
+                });
+            }
+
+            if self.capture.references.is_empty() {
+                break;
+            }
+            capture.references.extend(std::mem::take(&mut self.capture.references));
         }
+
+        self.capture = capture;
 
         symbols
     }
@@ -438,7 +455,8 @@ impl<'a> Context<'a> {
 
     fn resolve_references(&mut self, index: parse::NodeIndex) {
         if Some(index) == self.capture_node {
-            *self.capture.get_mut() = self.capture_symbols();
+            self.capture = self.capture_symbols();
+            self.capture_node = None;
         }
 
         let node = self.tree.node(index);
@@ -446,7 +464,7 @@ impl<'a> Context<'a> {
             parse::Tag::Identifier => {
                 let name = &self.source[node.byte_range()];
                 if let Some(reference) = self.resolve_reference_identifier(name) {
-                    self.references.get_mut().insert(index, reference);
+                    self.references.insert(index, reference);
                 } else {
                     let syntax_node = syntax::SyntaxNode::new(node, index);
                     self.error(Error::UnresolvedReference(ErrorUnresolvedReference {
@@ -468,7 +486,7 @@ impl<'a> Context<'a> {
                         self.builtin_tokens.attributes.get_key_value(text)
                     {
                         let reference = Reference::Attribute(&actual_name, info);
-                        self.references.get_mut().insert(name.index(), reference);
+                        self.references.insert(name.index(), reference);
                     }
 
                     if text == "builtin" {
@@ -534,7 +552,6 @@ impl<'a> Context<'a> {
                 self.resolve_references_maybe(data.attributes);
                 if let Some(name) = data.name {
                     self.references
-                        .get_mut()
                         .insert(name.index(), Reference::User(ReferenceNode::StructField(field)));
                 }
                 self.resolve_references_maybe(data.typ);
@@ -618,14 +635,14 @@ impl<'a> Context<'a> {
         if let Some(name) = name {
             let text = &self.source[name.byte_range()];
             self.scope.insert(text, node);
-            self.references.get_mut().insert(name.index(), Reference::User(node));
+            self.references.insert(name.index(), Reference::User(node));
         }
         self.resolve_references_maybe(typ);
         self.resolve_references_maybe(value);
     }
 
     fn check_variable_decl_types(
-        &self,
+        &mut self,
         _typ: Option<syntax::TypeSpecifier>,
         value: Option<syntax::Expression>,
     ) {
@@ -633,7 +650,13 @@ impl<'a> Context<'a> {
         self.infer_type_expr_maybe(value);
     }
 
-    fn check_stmt_types(&self, stmt: syntax::Statement) {
+    fn check_stmt_types_maybe(&mut self, stmt: Option<syntax::Statement>) {
+        if let Some(stmt) = stmt {
+            self.check_stmt_types(stmt);
+        }
+    }
+
+    fn check_stmt_types(&mut self, stmt: syntax::Statement) {
         match stmt {
             syntax::Statement::Block(block) => {
                 for stmt in block.statements(self.tree) {
@@ -656,35 +679,129 @@ impl<'a> Context<'a> {
                 let data = lett.extract(self.tree);
                 self.check_variable_decl_types(data.typ, data.value);
             },
+            syntax::Statement::Assign(assign) => {
+                let data = assign.extract(self.tree);
+                let lhs = self.infer_type_expr_maybe(data.lhs);
+                let rhs = self.infer_type_expr_maybe(data.rhs);
+                if let (Some(_lhs), Some(_rhs)) = (lhs, rhs) {
+                    // TODO: ensure that types are equal
+                }
+            },
+            syntax::Statement::Break(brek) => {
+                // TODO: ensure we are inside a loop
+                let data = brek.extract(self.tree);
+                // TODO: check that type is bool
+                self.infer_type_expr_maybe(data.condition);
+            },
+            syntax::Statement::ConstAssert(assert) => {
+                let data = assert.extract(self.tree);
+                // TODO: check that type is bool
+                self.infer_type_expr_maybe(data.expr);
+            },
+            syntax::Statement::Continue(_) => {
+                // TODO: ensure we are inside a loop
+            },
+            syntax::Statement::Continuing(continuing) => {
+                // TODO: ensure we are inside a loop
+                let data = continuing.extract(self.tree);
+                self.check_stmt_types_maybe(data.stmt);
+            },
+            syntax::Statement::Decrement(decrement) => {
+                let data = decrement.extract(self.tree);
+                self.infer_type_expr_maybe(data.expr);
+            },
+            syntax::Statement::Discard(_) => {},
+            syntax::Statement::For(foor) => {
+                let data = foor.extract(self.tree);
+                self.check_stmt_types_maybe(data.init);
+                // TODO: check that type is bool
+                self.infer_type_expr_maybe(data.condition);
+                self.check_stmt_types_maybe(data.post);
+                self.check_stmt_types_maybe(data.body);
+            },
+            syntax::Statement::If(fi) => {
+                for branch in fi.branches(self.tree) {
+                    let data = branch.extract(self.tree);
+                    // TODO: check that type is bool
+                    self.infer_type_expr_maybe(data.condition);
+                    self.check_stmt_types_maybe(data.body);
+                }
+            },
+            syntax::Statement::Increment(x) => {
+                let data = x.extract(self.tree);
+                self.infer_type_expr_maybe(data.expr);
+            },
+            syntax::Statement::Loop(x) => {
+                let data = x.extract(self.tree);
+                self.check_stmt_types_maybe(data.body);
+            },
+            syntax::Statement::Return(x) => {
+                let data = x.extract(self.tree);
+                // TODO: ensure type matches function return type
+                self.infer_type_expr_maybe(data.expr);
+            },
+            syntax::Statement::Switch(x) => {
+                let data = x.extract(self.tree);
+                // TODO: ensure type is switchable
+                self.infer_type_expr_maybe(data.expr);
+                if let Some(branches) = data.branches {
+                    for branch in branches.cases(self.tree) {
+                        let data_branch = branch.extract(self.tree);
+                        match data_branch.selector {
+                            Some(syntax::StmtSwitchBranchSelector::Default(_)) => {},
+                            Some(syntax::StmtSwitchBranchSelector::Case(case)) => {
+                                for pattern in case.patterns(self.tree) {
+                                    match pattern {
+                                        syntax::StmtSwitchBranchCasePattern::Default(_) => continue,
+                                        syntax::StmtSwitchBranchCasePattern::Expr(expr) => {
+                                            // TODO: ensure type matches condition
+                                            self.infer_type_expr(expr);
+                                        },
+                                    }
+                                }
+                            },
+                            None => {},
+                        }
+                        self.check_stmt_types_maybe(data_branch.body);
+                    }
+                }
+            },
+            syntax::Statement::While(x) => {
+                let data = x.extract(self.tree);
+                // TODO: check that type is bool
+                self.infer_type_expr_maybe(data.expr);
+                self.check_stmt_types_maybe(data.body);
+            },
         }
     }
 
-    fn infer_type_expr(&self, expr: syntax::Expression) -> Option<Type> {
+    fn infer_type_expr(&mut self, expr: syntax::Expression) -> Option<Type> {
         let index = expr.index();
-        if let Some(old) = self.types.borrow().get(&index) {
+        if let Some(old) = self.types.get(&index) {
             return old.clone();
         }
         let typ = self.infer_type_expr_uncached(expr);
-        self.types.borrow_mut().insert(index, typ.clone());
+        self.types.insert(index, typ.clone());
         typ
     }
 
     fn get_inferred_type(&self, node: parse::NodeIndex) -> Option<Type> {
-        self.types.borrow().get(&node)?.clone()
+        self.types.get(&node)?.clone()
     }
 
-    fn set_inferred_type(&self, node: parse::NodeIndex, typ: Option<Type>) {
-        self.types.borrow_mut().insert(node, typ);
+    fn set_inferred_type(&mut self, node: parse::NodeIndex, typ: Option<Type>) {
+        self.types.insert(node, typ);
     }
 
-    fn infer_type_expr_maybe(&self, expr: Option<syntax::Expression>) -> Option<Type> {
+    fn infer_type_expr_maybe(&mut self, expr: Option<syntax::Expression>) -> Option<Type> {
         self.infer_type_expr(expr?)
     }
 
-    fn infer_type_expr_uncached(&self, expr: syntax::Expression) -> Option<Type> {
+    fn infer_type_expr_uncached(&mut self, expr: syntax::Expression) -> Option<Type> {
         match expr {
             syntax::Expression::Identifier(name) => {
-                self.type_of_reference(self.references.borrow().get(&name.index())?)
+                let reference = *self.references.get(&name.index())?;
+                self.type_of_reference(reference)
             },
             syntax::Expression::IdentifierWithTemplate(identifier) => self.type_from_specifier(
                 syntax::TypeSpecifier::IdentifierWithTemplate(identifier),
@@ -785,6 +902,7 @@ impl<'a> Context<'a> {
                     Type::Mat(_, _, None) => return None,
 
                     Type::Array(Some(element), _) => Rc::unwrap_or_clone(element),
+                    Type::Array(None, _) => return None,
 
                     Type::Ptr(_, Some(inner), _) => match Rc::unwrap_or_clone(inner) {
                         Type::Array(Some(element), _) => Rc::unwrap_or_clone(element),
@@ -800,7 +918,10 @@ impl<'a> Context<'a> {
                 };
 
                 if let Some(typ) = index_type {
-                    if !matches!(typ, Type::Scalar(TypeScalar::I32 | TypeScalar::U32)) {
+                    if !matches!(
+                        typ,
+                        Type::Scalar(TypeScalar::I32 | TypeScalar::U32 | TypeScalar::AbstractInt)
+                    ) {
                         self.error(Error::InvalidIndexIndex(index, typ));
                     }
                 }
@@ -815,8 +936,6 @@ impl<'a> Context<'a> {
                 let is_capture = data.member.map(|x| x.index()) == self.capture_node
                     || data.dot_token.map(|x| x.index()) == self.capture_node;
                 if is_capture {
-                    let mut capture = self.capture.borrow_mut();
-
                     match target_type {
                         Type::Vec(count_raw, scalar) => {
                             let count = count_raw as usize;
@@ -831,7 +950,7 @@ impl<'a> Context<'a> {
                                             rem /= count;
                                         }
                                         let text = std::str::from_utf8(&buffer[..len]).unwrap();
-                                        capture.references.push((
+                                        self.capture.references.push((
                                             Cow::Owned(text.into()),
                                             Reference::Swizzle(len as u8, scalar),
                                         ));
@@ -846,7 +965,7 @@ impl<'a> Context<'a> {
                                     let data_field = field.extract(self.tree);
                                     if let Some(name) = data_field.name {
                                         let text = &self.source[name.byte_range()];
-                                        capture.references.push((
+                                        self.capture.references.push((
                                             text.into(),
                                             Reference::User(ReferenceNode::StructField(field)),
                                         ));
@@ -892,7 +1011,7 @@ impl<'a> Context<'a> {
                                 let field_text = &self.source[field_name.byte_range()];
                                 if field_text == member_text {
                                     let spec = data_field.typ?;
-                                    self.references.borrow_mut().insert(
+                                    self.references.insert(
                                         member.index(),
                                         Reference::User(ReferenceNode::StructField(field)),
                                     );
@@ -972,26 +1091,27 @@ impl<'a> Context<'a> {
 
                 use TypeScalar::*;
 
-                let coerced_scalar = |lhs: Option<TypeScalar>, rhs: Option<TypeScalar>| {
-                    if let Some(scalar) = TypeScalar::coerce(lhs, rhs) {
-                        return Some(scalar);
-                    }
+                let coerced_scalar =
+                    |ctx: &mut Self, lhs: Option<TypeScalar>, rhs: Option<TypeScalar>| {
+                        if let Some(scalar) = TypeScalar::coerce(lhs, rhs) {
+                            return Some(scalar);
+                        }
 
-                    if let (Some(lhs), Some(rhs)) = (lhs, rhs) {
-                        self.error(Error::InvalidCoercion(
-                            infix.node(),
-                            Type::Scalar(lhs),
-                            Type::Scalar(rhs),
-                        ));
-                    }
+                        if let (Some(lhs), Some(rhs)) = (lhs, rhs) {
+                            ctx.error(Error::InvalidCoercion(
+                                infix.node(),
+                                Type::Scalar(lhs),
+                                Type::Scalar(rhs),
+                            ));
+                        }
 
-                    None
-                };
+                        None
+                    };
 
-                let coerced = |lhs_typ: &Type, rhs_typ: &Type| {
+                let mut coerced = |lhs_typ: &Type, rhs_typ: &Type| {
                     Some(match (lhs_typ, rhs_typ) {
                         (&Type::Scalar(lhs), &Type::Scalar(rhs)) => {
-                            Type::Scalar(coerced_scalar(Some(lhs), Some(rhs))?)
+                            Type::Scalar(coerced_scalar(self, Some(lhs), Some(rhs))?)
                         },
 
                         (&Type::Vec(lhs_count, lhs_scalar), &Type::Vec(rhs_count, rhs_scalar))
@@ -1061,14 +1181,18 @@ impl<'a> Context<'a> {
                         (&Type::Scalar(lhs_scalar), &Type::Scalar(rhs_scalar))
                             if lhs_scalar.is_arithmetic() && rhs_scalar.is_arithmetic() =>
                         {
-                            Some(Type::Scalar(coerced_scalar(Some(lhs_scalar), Some(rhs_scalar))?))
+                            Some(Type::Scalar(coerced_scalar(
+                                self,
+                                Some(lhs_scalar),
+                                Some(rhs_scalar),
+                            )?))
                         },
 
                         (&Type::Scalar(scalar), &Type::Vec(count, vec_scalar))
                         | (&Type::Vec(count, vec_scalar), &Type::Scalar(scalar))
                             if scalar.is_arithmetic() && is_arithmetic_maybe(vec_scalar) =>
                         {
-                            Some(Type::Vec(count, coerced_scalar(Some(scalar), vec_scalar)))
+                            Some(Type::Vec(count, coerced_scalar(self, Some(scalar), vec_scalar)))
                         },
 
                         (&Type::Vec(lhs_count, lhs_scalar), &Type::Vec(rhs_count, rhs_scalar))
@@ -1076,7 +1200,7 @@ impl<'a> Context<'a> {
                                 && is_arithmetic_maybe(lhs_scalar)
                                 && is_arithmetic_maybe(rhs_scalar) =>
                         {
-                            Some(Type::Vec(lhs_count, coerced_scalar(lhs_scalar, rhs_scalar)))
+                            Some(Type::Vec(lhs_count, coerced_scalar(self, lhs_scalar, rhs_scalar)))
                         },
 
                         (&Type::Mat(cols, rows, mat_scalar), &Type::Scalar(scalar))
@@ -1085,7 +1209,11 @@ impl<'a> Context<'a> {
                                 && scalar.is_arithmetic()
                                 && is_arithmetic_maybe(mat_scalar) =>
                         {
-                            Some(Type::Mat(cols, rows, coerced_scalar(Some(scalar), mat_scalar)))
+                            Some(Type::Mat(
+                                cols,
+                                rows,
+                                coerced_scalar(self, Some(scalar), mat_scalar),
+                            ))
                         },
 
                         (&Type::Mat(cols, rows, mat_scalar), &Type::Vec(count, vec_scalar))
@@ -1094,7 +1222,7 @@ impl<'a> Context<'a> {
                                 && is_arithmetic_maybe(vec_scalar)
                                 && is_arithmetic_maybe(mat_scalar) =>
                         {
-                            Some(Type::Vec(rows, coerced_scalar(mat_scalar, mat_scalar)))
+                            Some(Type::Vec(rows, coerced_scalar(self, mat_scalar, mat_scalar)))
                         },
 
                         (&Type::Vec(count, vec_scalar), &Type::Mat(cols, rows, mat_scalar))
@@ -1103,7 +1231,7 @@ impl<'a> Context<'a> {
                                 && is_arithmetic_maybe(vec_scalar)
                                 && is_arithmetic_maybe(mat_scalar) =>
                         {
-                            Some(Type::Vec(cols, coerced_scalar(mat_scalar, mat_scalar)))
+                            Some(Type::Vec(cols, coerced_scalar(self, mat_scalar, mat_scalar)))
                         },
 
                         (
@@ -1121,7 +1249,7 @@ impl<'a> Context<'a> {
                             Some(Type::Mat(
                                 lhs_cols,
                                 lhs_rows,
-                                coerced_scalar(lhs_scalar, rhs_scalar),
+                                coerced_scalar(self, lhs_scalar, rhs_scalar),
                             ))
                         },
 
@@ -1193,11 +1321,13 @@ impl<'a> Context<'a> {
         }
     }
 
-    fn type_of_reference(&self, reference: &Reference) -> Option<Type> {
+    fn type_of_reference(&mut self, reference: Reference) -> Option<Type> {
         match reference {
             Reference::User(node) => match node {
-                ReferenceNode::Struct(strukt) => Some(Type::Type(Rc::new(Type::Struct(*strukt)))),
-                ReferenceNode::Fn(func) => Some(Type::Fn(*func)),
+                ReferenceNode::Struct(strukt) => Some(Type::Type(Rc::new(Type::Struct(strukt)))),
+                ReferenceNode::Fn(func) => Some(Type::Fn(func)),
+
+                ReferenceNode::ConstAssert(_) => None,
 
                 ReferenceNode::Alias(alias) => {
                     let spec = alias.extract(self.tree).typ?;
@@ -1238,8 +1368,8 @@ impl<'a> Context<'a> {
             Reference::BuiltinTypeAlias(_, text) => self.parse_type_specifier(text),
             Reference::BuiltinType(text) => self.parse_type_specifier(text),
 
-            &Reference::Swizzle(1, scalar) => Some(Type::Scalar(scalar?)),
-            &Reference::Swizzle(count, scalar) => Some(Type::Vec(count, scalar)),
+            Reference::Swizzle(1, scalar) => Some(Type::Scalar(scalar?)),
+            Reference::Swizzle(count, scalar) => Some(Type::Vec(count, scalar)),
 
             Reference::AccessMode(_) => None,
             Reference::AddressSpace(_) => None,
@@ -1250,7 +1380,7 @@ impl<'a> Context<'a> {
     }
 
     fn type_of_variable(
-        &self,
+        &mut self,
         spec: Option<syntax::TypeSpecifier>,
         value: Option<syntax::Expression>,
     ) -> Option<Type> {
@@ -1261,7 +1391,7 @@ impl<'a> Context<'a> {
         }
     }
 
-    fn parse_type_specifier(&self, text: &str) -> Option<Type> {
+    fn parse_type_specifier(&mut self, text: &str) -> Option<Type> {
         let mut parser = parse::Parser::new();
         let output = parse::parse_type_specifier(&mut parser, text);
         let tree = &output.tree;
@@ -1271,7 +1401,7 @@ impl<'a> Context<'a> {
     }
 
     fn type_from_specifier(
-        &self,
+        &mut self,
         spec: syntax::TypeSpecifier,
         tree: &parse::Tree,
         source: &str,
@@ -1291,7 +1421,7 @@ impl<'a> Context<'a> {
         let name = &source[identifier.byte_range()];
 
         // vvvvvvvvvvvvv HELPER FUNCTIONS vvvvvvvvvvvvv //
-        let type_inner = |context: &Self, parameter: Option<syntax::Expression>| {
+        let type_inner = |context: &mut Self, parameter: Option<syntax::Expression>| {
             let spec = match parameter? {
                 syntax::Expression::Identifier(x) => syntax::TypeSpecifier::Identifier(x),
                 syntax::Expression::IdentifierWithTemplate(x) => {
@@ -1301,7 +1431,7 @@ impl<'a> Context<'a> {
             };
             context.type_from_specifier(spec, tree, source).map(Type::unwrap_inner)
         };
-        let scalar = |context: &Self, parameter: Option<syntax::Expression>| match type_inner(
+        let scalar = |context: &mut Self, parameter: Option<syntax::Expression>| match type_inner(
             context, parameter,
         ) {
             Some(Type::Scalar(scalar)) => Some(scalar),
@@ -1333,7 +1463,7 @@ impl<'a> Context<'a> {
             },
             _ => None,
         };
-        let access = |_: &Self, parameter: Option<syntax::Expression>| match parameter? {
+        let access_mode = |_: &Self, parameter: Option<syntax::Expression>| match parameter? {
             syntax::Expression::Identifier(name) => {
                 AccessMode::from_str(&source[name.byte_range()])
             },
@@ -1342,11 +1472,36 @@ impl<'a> Context<'a> {
         // ^^^^^^^^^^^^^ HELPER FUNCTIONS ^^^^^^^^^^^^^ //
 
         if std::ptr::eq(self.tree, tree) {
-            if let Some(reference) = self.references.borrow().get(&identifier.index()) {
+            if let Some(&reference) = self.references.get(&identifier.index()) {
                 if let Some(mut typ) = self.type_of_reference(reference) {
                     let mut specify = |inner: &mut Type| match inner {
                         Type::Vec(_, s @ None) | Type::Mat(_, _, s @ None) => {
                             *s = scalar(self, params.next());
+                        },
+                        Type::Array(typ, count) => {
+                            let actual_typ = type_inner(self, params.next()).map(Rc::new);
+                            let actual_count =
+                                integer(self, params.next()).and_then(NonZeroU32::new);
+                            if typ.is_none() {
+                                *typ = actual_typ;
+                            }
+                            if count.is_none() {
+                                *count = actual_count;
+                            }
+                        },
+                        Type::Ptr(space, typ, mode) => {
+                            let actual_space = address_space(self, params.next());
+                            let actual_typ = type_inner(self, params.next()).map(Rc::new);
+                            let actual_mode = access_mode(self, params.next());
+                            if space.is_none() {
+                                *space = actual_space;
+                            }
+                            if typ.is_none() {
+                                *typ = actual_typ;
+                            }
+                            if mode.is_none() {
+                                *mode = actual_mode;
+                            }
                         },
                         _ => {},
                     };
@@ -1386,7 +1541,7 @@ impl<'a> Context<'a> {
             "ptr" => Type::Ptr(
                 address_space(self, params.next()),
                 type_inner(self, params.next()).map(Rc::new),
-                access(self, params.next()),
+                access_mode(self, params.next()),
             ),
 
             "array" => Type::Array(
@@ -1413,19 +1568,22 @@ impl<'a> Context<'a> {
             "texture_cube_array" => Type::TextureCubeArray(scalar(self, params.next())),
             "texture_multisampled_2d" => Type::TextureMultisampled2d(scalar(self, params.next())),
 
-            "texture_storage_1d" => {
-                Type::TextureStorage1d(format(self, params.next()), access(self, params.next()))
-            },
-            "texture_storage_2d" => {
-                Type::TextureStorage2d(format(self, params.next()), access(self, params.next()))
-            },
+            "texture_storage_1d" => Type::TextureStorage1d(
+                format(self, params.next()),
+                access_mode(self, params.next()),
+            ),
+            "texture_storage_2d" => Type::TextureStorage2d(
+                format(self, params.next()),
+                access_mode(self, params.next()),
+            ),
             "texture_storage_2d_array" => Type::TextureStorage2dArray(
                 format(self, params.next()),
-                access(self, params.next()),
+                access_mode(self, params.next()),
             ),
-            "texture_storage_3d" => {
-                Type::TextureStorage3d(format(self, params.next()), access(self, params.next()))
-            },
+            "texture_storage_3d" => Type::TextureStorage3d(
+                format(self, params.next()),
+                access_mode(self, params.next()),
+            ),
 
             // TODO: add samplers, textures, etc.
             _ => return None,
@@ -1460,7 +1618,7 @@ impl<'a> Context<'a> {
     pub(crate) fn find_all_references(&self, source: &Reference) -> Vec<parse::NodeIndex> {
         let mut result = Vec::new();
 
-        for (index, reference) in self.references.borrow().iter() {
+        for (index, reference) in self.references.iter() {
             if reference.eq(source) {
                 result.push(*index);
             }

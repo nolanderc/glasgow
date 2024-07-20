@@ -184,6 +184,7 @@ syntax_node_enum!(
         Alias(DeclAlias),
         Struct(DeclStruct),
         Const(DeclConst),
+        ConstAssert(DeclConstAssert),
         Override(DeclOverride),
         Var(DeclVar),
         Fn(DeclFn),
@@ -239,6 +240,15 @@ syntax_node_simple!(
         typ: TypeSpecifier,
         equal_token: Token!(Equal),
         value: Expression,
+        semi_token: Token!(SemiColon),
+    }
+);
+
+syntax_node_simple!(
+    DeclConstAssert,
+    struct DeclConstAssertData {
+        assert_token: Token!(KeywordConstAssert),
+        expr: Expression,
         semi_token: Token!(SemiColon),
     }
 );
@@ -303,11 +313,204 @@ syntax_node_simple!(
 
 syntax_node_enum!(
     enum Statement {
+        Assign(StmtAssign),
         Block(StmtBlock),
-        Expr(StmtExpr),
+        Break(StmtBreak),
         Const(DeclConst),
-        Var(DeclVar),
+        ConstAssert(DeclConstAssert),
+        Continue(StmtContinue),
+        Continuing(StmtContinuing),
+        Decrement(StmtDecrement),
+        Discard(StmtDiscard),
+        Expr(StmtExpr),
+        For(StmtFor),
+        If(StmtIf),
+        Increment(StmtIncrement),
         Let(StmtLet),
+        Loop(StmtLoop),
+        Return(StmtReturn),
+        Switch(StmtSwitch),
+        Var(DeclVar),
+        While(StmtWhile),
+    }
+);
+
+syntax_node_simple!(
+    StmtAssign,
+    struct StmtAssignData {
+        lhs: Expression,
+        op: AssignOp,
+        rhs: Expression,
+    }
+);
+
+syntax_node_enum!(
+    enum AssignOp {
+        Equal(Token!(Equal)),
+        LessLessEqual(Token!(LessLessEqual)),
+        GreaterGreaterEqual(Token!(GreaterGreaterEqual)),
+        PlusEqual(Token!(PlusEqual)),
+        MinusEqual(Token!(MinusEqual)),
+        AsteriskEqual(Token!(AsteriskEqual)),
+        SlashEqual(Token!(SlashEqual)),
+        PercentEqual(Token!(PercentEqual)),
+        ChevronEqual(Token!(ChevronEqual)),
+        AmpersandEqual(Token!(AmpersandEqual)),
+        BarEqual(Token!(BarEqual)),
+    }
+);
+
+syntax_node_simple!(
+    StmtBreak,
+    struct StmtBreakData {
+        break_token: Token!(KeywordBreak),
+        if_token: Token!(KeywordIf),
+        condition: Expression,
+        semi_token: Token!(KeywordBreak),
+    }
+);
+syntax_node_simple!(
+    StmtContinue,
+    struct StmtContinueData {
+        continue_token: Token!(KeywordContinue),
+        semi_token: Token!(KeywordBreak),
+    }
+);
+syntax_node_simple!(
+    StmtContinuing,
+    struct StmtContinuingData {
+        continuing_token: Token!(KeywordContinuing),
+        stmt: Statement,
+    }
+);
+syntax_node_simple!(
+    StmtDecrement,
+    struct StmtDecrementData {
+        expr: Expression,
+        decrement_token: Token!(MinusMinus),
+    }
+);
+syntax_node_simple!(
+    StmtDiscard,
+    struct StmtDiscardData {
+        continue_token: Token!(KeywordContinue),
+        semi_token: Token!(KeywordBreak),
+    }
+);
+syntax_node_simple!(
+    StmtFor,
+    struct StmtForData {
+        for_token: Token!(KeywordFor),
+        lparen_token: Token!(LParen),
+        init: Statement,
+        condition: Expression,
+        condition_semi: Token!(SemiColon),
+        post: Statement,
+        rparen_token: Token!(RParen),
+        body: Statement,
+    }
+);
+
+syntax_node_simple!(StmtIf);
+
+impl StmtIf {
+    pub fn branches(self, tree: &Tree) -> impl DoubleEndedIterator<Item = StmtIfBranch> + '_ {
+        self.0.children(tree).filter_map(StmtIfBranch::new)
+    }
+}
+
+syntax_node_simple!(
+    StmtIfBranch,
+    struct StmtIfBranchData {
+        else_token: Token!(KeywordElse),
+        if_token: Token!(KeywordIf),
+        condition: Expression,
+        body: Statement,
+    }
+);
+
+syntax_node_simple!(
+    StmtIncrement,
+    struct StmtIncrementData {
+        expr: Expression,
+        increment_token: Token!(PlusPlus),
+    }
+);
+
+syntax_node_simple!(
+    StmtLoop,
+    struct StmtLoopData {
+        loop_token: Token!(KeywordLoop),
+        body: Statement,
+    }
+);
+
+syntax_node_simple!(
+    StmtReturn,
+    struct StmtReturnData {
+        return_token: Token!(KeywordReturn),
+        expr: Expression,
+        semi_token: Token!(SemiColon),
+    }
+);
+
+syntax_node_simple!(
+    StmtSwitch,
+    struct StmtSwitchData {
+        switch_token: Token!(KeywordSwitch),
+        expr: Expression,
+        lcurly_token: Token!(LCurly),
+        branches: StmtSwitchBranchList,
+        rcurly_token: Token!(RCurly),
+    }
+);
+
+syntax_node_simple!(StmtSwitchBranchList);
+impl StmtSwitchBranchList {
+    pub fn cases(self, tree: &Tree) -> impl DoubleEndedIterator<Item = StmtSwitchBranch> + '_ {
+        self.0.children(tree).filter_map(StmtSwitchBranch::new)
+    }
+}
+
+syntax_node_simple!(
+    StmtSwitchBranch,
+    struct StmtSwitchBranchData {
+        selector: StmtSwitchBranchSelector,
+        colon_token: Token!(Colon),
+        body: Statement,
+    }
+);
+
+syntax_node_enum!(
+    enum StmtSwitchBranchSelector {
+        Default(Token!(KeywordDefault)),
+        Case(StmtSwitchBranchCase),
+    }
+);
+
+syntax_node_simple!(StmtSwitchBranchCase);
+impl StmtSwitchBranchCase {
+    pub fn patterns(
+        self,
+        tree: &Tree,
+    ) -> impl DoubleEndedIterator<Item = StmtSwitchBranchCasePattern> + '_ {
+        self.0.children(tree).filter_map(StmtSwitchBranchCasePattern::new)
+    }
+}
+
+syntax_node_enum!(
+    enum StmtSwitchBranchCasePattern {
+        Default(Token!(KeywordDefault)),
+        Expr(Expression),
+    }
+);
+
+syntax_node_simple!(
+    StmtWhile,
+    struct StmtWhileData {
+        while_token: Token!(KeywordWhile),
+        expr: Expression,
+        body: Statement,
     }
 );
 

@@ -170,9 +170,9 @@ pub enum Tag {
     ArgumentList,
     Attribute,
     AttributeList,
-    ConstAssert,
     DeclAlias,
     DeclConst,
+    DeclConstAssert,
     DeclFn,
     DeclFnOutput,
     DeclFnParameter,
@@ -212,7 +212,8 @@ pub enum Tag {
     StmtReturn,
     StmtSwitch,
     StmtSwitchBranch,
-    StmtSwitchCaseSelector,
+    StmtSwitchBranchList,
+    StmtSwitchBranchCase,
     StmtWhile,
     TemplateList,
     TemplateParameter,
@@ -793,7 +794,7 @@ pub fn parse_file<'parser, 'src>(
                 parser.advance();
                 expression(parser);
                 parser.expect(Tag::SemiColon);
-                parser.close(m, Tag::ConstAssert);
+                parser.close(m, Tag::DeclConstAssert);
             },
 
             Tag::KeywordStruct => {
@@ -925,7 +926,7 @@ fn statement(parser: &mut Parser) {
             parser.advance();
             expression(parser);
             parser.expect(Tag::SemiColon);
-            parser.close(m, Tag::ConstAssert);
+            parser.close(m, Tag::DeclConstAssert);
         },
 
         Tag::KeywordDiscard => {
@@ -1037,6 +1038,7 @@ fn statement(parser: &mut Parser) {
                     parser.advance();
                     expression(parser);
 
+                    let mark_body = parser.open();
                     parser.expect(Tag::LCurly);
                     while parser.at(Tag::KeywordCase) || parser.at(Tag::KeywordDefault) {
                         let m = parser.open();
@@ -1055,7 +1057,7 @@ fn statement(parser: &mut Parser) {
                                 if !parser.at_any(CASE_FOLLOWS) {
                                     parser.expect(Tag::Comma);
                                 }
-                                parser.close(m, Tag::StmtSwitchCaseSelector);
+                                parser.close(m, Tag::StmtSwitchBranchCase);
                             }
                         } else {
                             parser.expect(Tag::KeywordDefault);
@@ -1067,6 +1069,7 @@ fn statement(parser: &mut Parser) {
                         parser.close(m, Tag::StmtSwitchBranch);
                     }
                     parser.expect(Tag::RCurly);
+                    parser.close(mark_body, Tag::StmtSwitchBranchList);
 
                     parser.close(m, Tag::StmtSwitch);
                 },

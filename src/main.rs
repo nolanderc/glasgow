@@ -57,7 +57,10 @@ struct CommunicationSocket {
 
 fn main() -> Result<()> {
     let arguments = <Arguments as clap::Parser>::parse();
-    tracing_subscriber::fmt().with_writer(std::io::stderr).init();
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
 
     let (connection, threads) = match &arguments.communication {
         None | Some(Communication::Stdio) => lsp_server::Connection::stdio(),
@@ -181,6 +184,8 @@ fn add_routes(router: &mut Router) {
                     analyze::ReferenceNode::Const(_) | analyze::ReferenceNode::Override(_) => {
                         lsp::CompletionItemKind::CONSTANT
                     },
+
+                    analyze::ReferenceNode::ConstAssert(_) => lsp::CompletionItemKind::KEYWORD,
 
                     analyze::ReferenceNode::Var(_)
                     | analyze::ReferenceNode::FnParameter(_)
@@ -509,13 +514,14 @@ fn symbol_documentation(
                     tree.byte_range_total_children(children)
                 },
                 analyze::ReferenceNode::Alias(x) => tree.byte_range_total(x.index()),
-                analyze::ReferenceNode::Struct(x) => tree.byte_range_total(x.index()),
-                analyze::ReferenceNode::StructField(x) => tree.byte_range_total(x.index()),
                 analyze::ReferenceNode::Const(x) => tree.byte_range_total(x.index()),
-                analyze::ReferenceNode::Override(x) => tree.byte_range_total(x.index()),
-                analyze::ReferenceNode::Var(x) => tree.byte_range_total(x.index()),
+                analyze::ReferenceNode::ConstAssert(x) => tree.byte_range_total(x.index()),
                 analyze::ReferenceNode::FnParameter(x) => tree.byte_range_total(x.index()),
                 analyze::ReferenceNode::Let(x) => tree.byte_range_total(x.index()),
+                analyze::ReferenceNode::Override(x) => tree.byte_range_total(x.index()),
+                analyze::ReferenceNode::Struct(x) => tree.byte_range_total(x.index()),
+                analyze::ReferenceNode::StructField(x) => tree.byte_range_total(x.index()),
+                analyze::ReferenceNode::Var(x) => tree.byte_range_total(x.index()),
             };
 
             if let Some(range) = snippet_range {
