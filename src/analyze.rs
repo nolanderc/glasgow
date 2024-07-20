@@ -463,6 +463,13 @@ impl<'a> Context<'a> {
 
                 if let Some(name) = data.name {
                     let text = &self.source[name.byte_range()];
+
+                    let names = self.builtin_tokens.attributes.as_slice();
+                    if let Ok(index) = names.binary_search_by(|x| x.as_str().cmp(text)) {
+                        let reference = Reference::Attribute(&names[index]);
+                        self.references.get_mut().insert(name.index(), reference);
+                    }
+
                     if text == "builtin" {
                         let old = std::mem::replace(&mut self.within_attribute_builtin, true);
                         if let Some(arguments) = data.arguments {
