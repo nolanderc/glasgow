@@ -1729,8 +1729,8 @@ pub struct ResolvedSymbol {
 
 #[derive(Debug, Clone)]
 pub enum Type {
-    /// The type of a specific type. For example, `u32` in source code would have the type
-    /// `Type(u32)`, while the number `123u` would have the actual type `u32`.
+    /// The type of a specific type. For example, the identifier `u32` in source code would have
+    /// the meta-type `type<u32>`, while the number `123u` would have the actual type `u32`.
     #[allow(clippy::enum_variant_names)]
     Type(Rc<Type>),
 
