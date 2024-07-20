@@ -1230,7 +1230,11 @@ impl<'a> Context<'a> {
                 },
             },
 
+            // TODO: parse function signature
+            // this is a bit complicated due to most signatures being generic, so we will have to
+            // do some things a bit differently.
             Reference::BuiltinFunction(_) => None,
+
             Reference::BuiltinTypeAlias(_, text) => self.parse_type_specifier(text),
             Reference::BuiltinType(text) => self.parse_type_specifier(text),
 
