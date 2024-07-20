@@ -124,8 +124,8 @@ pub enum Reference {
     AccessMode(AccessMode),
     AddressSpace(AddressSpace),
     TextureFormat(TextureFormat),
-    Attribute(&'static str),
-    AttributeBuiltin(&'static str),
+    Attribute(&'static String, &'static wgsl_spec::Attribute),
+    AttributeBuiltin(&'static String, &'static wgsl_spec::BuiltinValue),
 }
 
 impl Reference {
@@ -355,10 +355,10 @@ impl<'a> Context<'a> {
         let mut symbols = Vec::with_capacity(count);
 
         if self.capture_options.attributes {
-            for attribute in self.builtin_tokens.attributes.iter() {
+            for (name, attribute) in self.builtin_tokens.attributes.iter() {
                 symbols.push(ResolvedSymbol {
-                    name: attribute.into(),
-                    reference: Reference::Attribute(attribute),
+                    name: name.into(),
+                    reference: Reference::Attribute(name, attribute),
                     typ: None,
                 });
             }
@@ -404,8 +404,8 @@ impl<'a> Context<'a> {
         let mut references = Vec::new();
 
         if self.within_attribute_builtin {
-            for name in self.builtin_tokens.builtin_values.iter() {
-                references.push((name.into(), Reference::AttributeBuiltin(name)));
+            for (name, info) in self.builtin_tokens.builtin_values.iter() {
+                references.push((name.into(), Reference::AttributeBuiltin(name, info)));
             }
         }
 
@@ -464,9 +464,10 @@ impl<'a> Context<'a> {
                 if let Some(name) = data.name {
                     let text = &self.source[name.byte_range()];
 
-                    let names = self.builtin_tokens.attributes.as_slice();
-                    if let Ok(index) = names.binary_search_by(|x| x.as_str().cmp(text)) {
-                        let reference = Reference::Attribute(&names[index]);
+                    if let Some((actual_name, info)) =
+                        self.builtin_tokens.attributes.get_key_value(text)
+                    {
+                        let reference = Reference::Attribute(&actual_name, info);
                         self.references.get_mut().insert(name.index(), reference);
                     }
 
@@ -563,9 +564,8 @@ impl<'a> Context<'a> {
 
     fn resolve_reference_identifier(&mut self, name: &'a str) -> Option<Reference> {
         if self.within_attribute_builtin {
-            let names = self.builtin_tokens.builtin_values.as_slice();
-            if let Ok(index) = names.binary_search_by(|x| x.as_str().cmp(name)) {
-                return Some(Reference::AttributeBuiltin(&names[index]));
+            if let Some((name, info)) = self.builtin_tokens.builtin_values.get_key_value(name) {
+                return Some(Reference::AttributeBuiltin(name, info));
             }
         }
 
@@ -1240,8 +1240,8 @@ impl<'a> Context<'a> {
             Reference::AccessMode(_) => None,
             Reference::AddressSpace(_) => None,
             Reference::TextureFormat(_) => None,
-            Reference::Attribute(_) => None,
-            Reference::AttributeBuiltin(_) => None,
+            Reference::Attribute(_, _) => None,
+            Reference::AttributeBuiltin(_, builtin) => self.parse_type_specifier(&builtin.typ),
         }
     }
 

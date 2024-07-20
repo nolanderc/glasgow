@@ -190,8 +190,8 @@ fn add_routes(router: &mut Router) {
                 analyze::Reference::AccessMode(_)
                 | analyze::Reference::AddressSpace(_)
                 | analyze::Reference::TextureFormat(_)
-                | analyze::Reference::Attribute(_)
-                | analyze::Reference::AttributeBuiltin(_) => CompletionItemKind::KEYWORD,
+                | analyze::Reference::Attribute(_, _)
+                | analyze::Reference::AttributeBuiltin(_, _) => CompletionItemKind::KEYWORD,
             });
 
             completions.push(item);
@@ -619,12 +619,29 @@ fn symbol_documentation(
             writeln!(markdown, "Texture Format: `{}`", format)?;
         },
 
-        analyze::Reference::Attribute(name) => {
+        analyze::Reference::Attribute(name, info) => {
             writeln!(markdown, "`@{}`", name)?;
+            writeln!(markdown)?;
+            writeln!(markdown, "{}", info.description)?;
+            if let Some(parameters) = &info.description_parameters {
+                writeln!(markdown)?;
+                writeln!(markdown, "## Parameters")?;
+                writeln!(markdown, "{}", parameters)?;
+            }
         },
 
-        analyze::Reference::AttributeBuiltin(name) => {
-            writeln!(markdown, "`@builtin({})`", name)?;
+        analyze::Reference::AttributeBuiltin(name, info) => {
+            writeln!(markdown, "`@builtin({}) : {}`", name, info.typ)?;
+
+            for (stage, info_stage) in info.stages.iter().rev() {
+                let direction = match info_stage.direction {
+                    wgsl_spec::BuiltinValueDirection::Input => "input",
+                    wgsl_spec::BuiltinValueDirection::Output => "output",
+                };
+                writeln!(markdown)?;
+                writeln!(markdown, "## Shader Stage: `{}` ({})", stage, direction)?;
+                writeln!(markdown, "{}", info_stage.description)?;
+            }
         },
     }
 
