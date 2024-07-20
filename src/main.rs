@@ -54,7 +54,7 @@ struct CommunicationSocket {
 
 fn main() -> Result<()> {
     let arguments = <Arguments as clap::Parser>::parse();
-    tracing_subscriber::fmt().init();
+    tracing_subscriber::fmt().with_writer(std::io::stderr).init();
 
     let (connection, threads) = match &arguments.communication {
         None | Some(Communication::Stdio) => lsp_server::Connection::stdio(),
