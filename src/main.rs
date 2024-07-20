@@ -59,7 +59,7 @@ fn main() -> Result<()> {
     let (connection, threads) = match &arguments.communication {
         None | Some(Communication::Stdio) => lsp_server::Connection::stdio(),
         Some(Communication::Socket(socket)) => {
-            tracing::info!(%socket.addr, socket.port, "waiting on connection");
+            tracing::debug!(%socket.addr, socket.port, "waiting on connection");
             lsp_server::Connection::listen((socket.addr, socket.port))
                 .context("could not establish connection")?
         },
@@ -311,7 +311,7 @@ fn publish_diagnostics_for_document(
 ) -> Result<()> {
     let document = state.workspace.document(&document_id.uri)?;
     if document.version() != Some(document_id.version) {
-        tracing::info!("document out of date");
+        tracing::debug!("document out of date");
         // document is out-of-date
         return Ok(());
     }
@@ -691,7 +691,7 @@ fn documentation_builtin_function(
 }
 
 fn run_server(_arguments: Arguments, connection: lsp_server::Connection) -> Result<()> {
-    tracing::info!("starting server");
+    tracing::debug!("starting server");
 
     let server_capabilities = lsp::ServerCapabilities {
         text_document_sync: Some(lsp::TextDocumentSyncCapability::Kind(
@@ -723,7 +723,7 @@ fn run_server(_arguments: Arguments, connection: lsp_server::Connection) -> Resu
     let _initialize_params: lsp::InitializeParams =
         serde_json::from_value(connection.initialize(serde_json::to_value(server_capabilities)?)?)?;
 
-    tracing::info!("LSP initialized");
+    tracing::debug!("LSP initialized");
 
     let mut router = Router::default();
     add_routes(&mut router);
@@ -989,7 +989,7 @@ impl Router {
             message: format!("unsupported method {method:?}"),
             data: None,
         })?;
-        tracing::info!("invoking handler");
+        tracing::debug!("invoking handler");
         (handler.callback)(state, params)
     }
 }
