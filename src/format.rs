@@ -29,6 +29,8 @@ struct State {
     next_extra: usize,
     last_emit: usize,
 
+    line: usize,
+
     /// If set to `true`, the next token emitted will not have any leading space inserted.
     force_no_space_before: bool,
 
@@ -47,7 +49,8 @@ impl<'a> Formatter<'a> {
                 previous_token: Tag::Eof,
                 next_extra: 0,
                 last_emit: 0,
-                force_no_space_before: true,
+                line: 0,
+                force_no_space_before: false,
                 indent: 0,
                 indent_base: 0,
                 needs_indent: false,
@@ -235,28 +238,35 @@ impl<'a> Formatter<'a> {
                         self.indent_increase();
                     }
                 } else {
-                    self.output.extend(std::iter::repeat(' ').take(padding));
+                    self.output.reserve(padding);
+                    for _ in 0..padding {
+                        self.output.push(' ');
+                    }
 
                     let len_before = self.output.len();
+                    let line_before = self.state.line;
+
                     self.emit_node(child);
+
                     let len_after = self.output.len();
+                    let line_after = self.state.line;
 
                     if multiline && multicolumn {
-                        let inner = &self.output[len_before..len_after];
-                        if inner.contains('\n') {
+                        if line_before != line_after {
                             multicolumn = false;
                             self.state = state.clone();
                             self.output.truncate(output_len);
                             continue 'outer;
                         }
 
-                        let size = inner.trim().len();
+                        let size = self.output[len_before..len_after].trim().len();
                         if column >= column_sizes.len() {
                             column_sizes.push(size);
                         } else if size > column_sizes[column] {
                             column_sizes[column] = size;
                             aligned = false;
                         } else {
+                            // +1 for spacing between arguments
                             padding = column_sizes[column] - size + 1;
                         }
                         column += 1;
@@ -478,6 +488,7 @@ impl<'a> Formatter<'a> {
         }
         self.output += "\n";
         self.state.needs_indent = true;
+        self.state.line += 1;
     }
 }
 
