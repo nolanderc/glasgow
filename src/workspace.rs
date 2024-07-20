@@ -198,13 +198,13 @@ impl Document {
         })
     }
 
-    pub fn symbol_at_offset(
+    pub fn symbol_in_range(
         &self,
-        offset: OffsetUtf8,
+        range: std::ops::Range<usize>,
     ) -> Option<(crate::analyze::ResolvedSymbol, crate::parse::NodeIndex)> {
         let parsed = self.parse();
 
-        let token_path = parsed.tree.token_path_at_offset_utf8(offset);
+        let token_path = parsed.tree.token_path_in_range_utf8(range);
         let token = *token_path.last()?;
         assert_eq!(token_path[0], parsed.tree.root_index());
 
@@ -218,13 +218,13 @@ impl Document {
         Some((context.get_node_symbol(token)?, token))
     }
 
-    pub fn visible_symbols_at_offset(
+    pub fn visible_symbols_in_range(
         &self,
-        offset: OffsetUtf8,
+        range: std::ops::Range<usize>,
     ) -> Option<(Vec<crate::analyze::ResolvedSymbol>, crate::parse::NodeIndex)> {
         let parsed = self.parse();
 
-        let token_path = parsed.tree.token_path_at_offset_utf8(offset);
+        let token_path = parsed.tree.token_path_in_range_utf8(range);
         let token = *token_path.last()?;
         assert_eq!(token_path[0], parsed.tree.root_index());
 
@@ -234,7 +234,18 @@ impl Document {
         let global_scope = &self.global_scope().symbols;
         let mut context = analyze::Context::new(global_scope, &parsed.tree, &self.content);
 
-        context.capture_symbols_at(token);
+        let mut options = analyze::CaptureOptions::default();
+        for &index in token_path.iter() {
+            let node = parsed.tree.node(index);
+            match node.tag() {
+                crate::parse::Tag::Attribute => options.attributes = true,
+                crate::parse::Tag::ArgumentList => options.attributes = false,
+                crate::parse::Tag::TemplateList => options.template_arguments = true,
+                _ => continue,
+            }
+        }
+        context.capture_symbols_at(token, options);
+
         context.analyze_decl(decl);
         let symbols = context.get_captured_symbols();
 

@@ -84,6 +84,10 @@ pub struct Context<'a> {
 
     errors: RefCell<Vec<Error>>,
 
+    /// Set to  `true` only if we are within a `@builtin` attribute.
+    /// Used to resolve context-dependent attribute names.
+    within_attribute_builtin: bool,
+
     /// identifiers which have had their reference resolved.
     references: RefCell<HashMap<parse::NodeIndex, Reference>>,
 
@@ -93,8 +97,16 @@ pub struct Context<'a> {
     /// If set, we should record a capture of the visible symbols during name resolution.
     /// At which node we should perform the capture.
     capture_node: Option<parse::NodeIndex>,
+    /// What to capture.
+    capture_options: CaptureOptions,
     /// The references we captured during name resolution.
     capture: RefCell<CaptureSymbols<'a>>,
+}
+
+#[derive(Debug, Default)]
+pub struct CaptureOptions {
+    pub attributes: bool,
+    pub template_arguments: bool,
 }
 
 #[derive(Default)]
@@ -109,6 +121,11 @@ pub enum Reference {
     BuiltinTypeAlias(&'static String, &'static String),
     BuiltinType(&'static str),
     Swizzle(u8, Option<TypeScalar>),
+    AccessMode(AccessMode),
+    AddressSpace(AddressSpace),
+    TextureFormat(TextureFormat),
+    Attribute(&'static str),
+    AttributeBuiltin(&'static str),
 }
 
 impl Reference {
@@ -216,10 +233,14 @@ impl<'a> Context<'a> {
             source,
             scope: Scope::new(),
             errors: Vec::new().into(),
+
+            within_attribute_builtin: false,
+
             references: Default::default(),
             types: Default::default(),
 
             capture_node: None,
+            capture_options: Default::default(),
             capture: Default::default(),
         };
 
@@ -314,13 +335,58 @@ impl<'a> Context<'a> {
         })
     }
 
-    pub fn capture_symbols_at(&mut self, node: parse::NodeIndex) {
+    pub fn capture_symbols_at(&mut self, node: parse::NodeIndex, options: CaptureOptions) {
         self.capture_node = Some(node);
+        self.capture_options = options;
     }
 
     pub fn get_captured_symbols(&self) -> Vec<ResolvedSymbol> {
         let capture = self.capture.borrow();
-        let mut symbols = Vec::with_capacity(capture.references.len());
+
+        let mut count = capture.references.len();
+
+        if self.capture_options.attributes {
+            count += self.builtin_tokens.attributes.len();
+        }
+        if self.capture_options.template_arguments {
+            count += AccessMode::ALL.len() + AddressSpace::ALL.len() + TextureFormat::ALL.len();
+        }
+
+        let mut symbols = Vec::with_capacity(count);
+
+        if self.capture_options.attributes {
+            for attribute in self.builtin_tokens.attributes.iter() {
+                symbols.push(ResolvedSymbol {
+                    name: attribute.into(),
+                    reference: Reference::Attribute(attribute),
+                    typ: None,
+                });
+            }
+        }
+
+        if self.capture_options.template_arguments {
+            for &mode in AccessMode::ALL {
+                symbols.push(ResolvedSymbol {
+                    name: mode.as_str().into(),
+                    reference: Reference::AccessMode(mode),
+                    typ: None,
+                })
+            }
+            for &space in AddressSpace::ALL {
+                symbols.push(ResolvedSymbol {
+                    name: space.as_str().into(),
+                    reference: Reference::AddressSpace(space),
+                    typ: None,
+                })
+            }
+            for &format in TextureFormat::ALL {
+                symbols.push(ResolvedSymbol {
+                    name: format.as_str().into(),
+                    reference: Reference::TextureFormat(format),
+                    typ: None,
+                })
+            }
+        }
 
         for (name, reference) in capture.references.iter() {
             symbols.push(ResolvedSymbol {
@@ -336,6 +402,12 @@ impl<'a> Context<'a> {
     #[cold]
     fn capture_symbols(&mut self) -> CaptureSymbols<'a> {
         let mut references = Vec::new();
+
+        if self.within_attribute_builtin {
+            for name in self.builtin_tokens.builtin_values.iter() {
+                references.push((name.into(), Reference::AttributeBuiltin(name)));
+            }
+        }
 
         for (name, node) in self.scope.iter_symbols() {
             references.push((name.into(), Reference::User(node)));
@@ -373,40 +445,31 @@ impl<'a> Context<'a> {
         match node.tag() {
             parse::Tag::Identifier => {
                 let name = &self.source[node.byte_range()];
-
-                let reference = if let Some(local) = self.scope.get(name) {
-                    Reference::User(local)
-                } else if let Some(global) = self.global_scope.get(name) {
-                    Reference::User(global.node)
-                } else if let Some(reference) = self.get_builtin_type(name) {
-                    reference
-                } else if let Some(builtin) = self.builtin_functions.functions.get(name) {
-                    Reference::BuiltinFunction(builtin)
-                } else if let Some((name, original)) =
-                    self.builtin_tokens.type_aliases.get_key_value(name)
-                {
-                    Reference::BuiltinTypeAlias(name, original)
+                if let Some(reference) = self.resolve_reference_identifier(name) {
+                    self.references.get_mut().insert(index, reference);
                 } else {
+                    let syntax_node = syntax::SyntaxNode::new(node, index);
                     self.error(Error::UnresolvedReference(ErrorUnresolvedReference {
-                        node: <syntax::Token!(Identifier)>::new(syntax::SyntaxNode::new(
-                            node, index,
-                        ))
-                        .unwrap(),
+                        node: <syntax::Token!(Identifier)>::new(syntax_node).unwrap(),
                     }));
-                    return;
-                };
-
-                self.references.get_mut().insert(index, reference);
+                }
             },
 
             parse::Tag::Attribute => {
                 // don't attempt to resolve the attribute name
                 let syntax_node = syntax::SyntaxNode::new(node, index);
                 let attribute = syntax::Attribute::new(syntax_node).unwrap();
+                let data = attribute.extract(self.tree);
 
-                // TODO: introduce context-dependent names
-                if let Some(_arguments) = attribute.extract(self.tree).arguments {
-                    // self.resolve_references(arguments.index());
+                if let Some(name) = data.name {
+                    let text = &self.source[name.byte_range()];
+                    if text == "builtin" {
+                        let old = std::mem::replace(&mut self.within_attribute_builtin, true);
+                        if let Some(arguments) = data.arguments {
+                            self.resolve_references(arguments.index());
+                        }
+                        self.within_attribute_builtin = old;
+                    }
                 }
             },
 
@@ -489,6 +552,47 @@ impl<'a> Context<'a> {
                 }
             },
         }
+    }
+
+    fn resolve_reference_identifier(&mut self, name: &'a str) -> Option<Reference> {
+        if self.within_attribute_builtin {
+            let names = self.builtin_tokens.builtin_values.as_slice();
+            if let Ok(index) = names.binary_search_by(|x| x.as_str().cmp(name)) {
+                return Some(Reference::AttributeBuiltin(&names[index]));
+            }
+        }
+
+        if let Some(local) = self.scope.get(name) {
+            return Some(Reference::User(local));
+        }
+
+        if let Some(global) = self.global_scope.get(name) {
+            return Some(Reference::User(global.node));
+        }
+
+        if let Some(reference) = self.get_builtin_type(name) {
+            return Some(reference);
+        }
+
+        if let Some(builtin) = self.builtin_functions.functions.get(name) {
+            return Some(Reference::BuiltinFunction(builtin));
+        }
+
+        if let Some((name, original)) = self.builtin_tokens.type_aliases.get_key_value(name) {
+            return Some(Reference::BuiltinTypeAlias(name, original));
+        }
+
+        if let Some(space) = AddressSpace::from_str(name) {
+            return Some(Reference::AddressSpace(space));
+        }
+        if let Some(mode) = AccessMode::from_str(name) {
+            return Some(Reference::AccessMode(mode));
+        }
+        if let Some(format) = TextureFormat::from_str(name) {
+            return Some(Reference::TextureFormat(format));
+        }
+
+        None
     }
 
     fn resolve_references_maybe(&mut self, index: Option<impl syntax::SyntaxNodeMatch>) {
@@ -1118,12 +1222,19 @@ impl<'a> Context<'a> {
                     self.type_of_variable(data.typ, data.value)
                 },
             },
+
             Reference::BuiltinFunction(_) => None,
             Reference::BuiltinTypeAlias(_, text) => self.parse_type_specifier(text),
             Reference::BuiltinType(text) => self.parse_type_specifier(text),
 
             &Reference::Swizzle(1, scalar) => Some(Type::Scalar(scalar?)),
             &Reference::Swizzle(count, scalar) => Some(Type::Vec(count, scalar)),
+
+            Reference::AccessMode(_) => None,
+            Reference::AddressSpace(_) => None,
+            Reference::TextureFormat(_) => None,
+            Reference::Attribute(_) => None,
+            Reference::AttributeBuiltin(_) => None,
         }
     }
 
@@ -1716,149 +1827,96 @@ impl std::fmt::Display for TypeScalar {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub enum AddressSpace {
-    Function,
-    Private,
-    Workgroup,
-    Uniform,
-    Storage,
-    Handle,
+macro_rules! derive_enum {
+    (
+        $( #[$meta:meta] )*
+        $pub:vis enum $name:ident {
+            $( $variant:ident = $text:literal ),* $(,)?
+        }
+    ) => {
+        $( #[$meta] )*
+        $pub enum $name {
+            $( $variant ),*
+        }
+
+        impl $name {
+            pub const ALL: &'static [$name] = &[ $( $name::$variant ),* ];
+
+            pub fn from_str(text: &str) -> Option<$name> {
+                match text {
+                    $( $text => Some($name::$variant), )*
+                    _ => None,
+                }
+            }
+
+            pub fn as_str(self) -> &'static str {
+                match self {
+                    $( $name::$variant => $text, )*
+                }
+            }
+        }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                self.as_str().fmt(f)
+            }
+        }
+    };
 }
+
+derive_enum!(
+    #[derive(Debug, Clone, Copy)]
+    pub enum AddressSpace {
+        Function = "function",
+        Private = "private",
+        Workgroup = "workgroup",
+        Uniform = "uniform",
+        Storage = "storage",
+        Handle = "handle",
+    }
+);
 
 impl AddressSpace {
-    pub fn from_str(text: &str) -> Option<AddressSpace> {
-        Some(match text {
-            "function" => AddressSpace::Function,
-            "private" => AddressSpace::Private,
-            "workgroup" => AddressSpace::Workgroup,
-            "uniform" => AddressSpace::Uniform,
-            "storage" => AddressSpace::Storage,
-            "handle" => AddressSpace::Handle,
-            _ => return None,
-        })
-    }
-
-    fn as_str(self) -> &'static str {
+    pub fn default_access_mode(self) -> AccessMode {
         match self {
-            AddressSpace::Function => "function",
-            AddressSpace::Private => "private",
-            AddressSpace::Workgroup => "workgroup",
-            AddressSpace::Uniform => "uniform",
-            AddressSpace::Storage => "storage",
-            AddressSpace::Handle => "handle",
+            AddressSpace::Function | AddressSpace::Private | AddressSpace::Workgroup => {
+                AccessMode::ReadWrite
+            },
+            AddressSpace::Uniform | AddressSpace::Storage | AddressSpace::Handle => {
+                AccessMode::Read
+            },
         }
     }
 }
 
-impl std::fmt::Display for AddressSpace {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.as_str().fmt(f)
+derive_enum!(
+    #[derive(Debug, Clone, Copy)]
+    pub enum TextureFormat {
+        Rgba8Unorm = "rgba8unorm",
+        Rgba8Snorm = "rgba8snorm",
+        Rgba8Uint = "rgba8uint",
+        Rgba8Sint = "rgba8sint",
+        Rgba16Uint = "rgba16uint",
+        Rgba16Sint = "rgba16sint",
+        Rgba16Float = "rgba16float",
+        R32Uint = "r32uint",
+        R32Sint = "r32sint",
+        R32Float = "r32float",
+        Rg32Uint = "rg32uint",
+        Rg32Sint = "rg32sint",
+        Rg32Float = "rg32float",
+        Rgba32Uint = "rgba32uint",
+        Rgba32Sint = "rgba32sint",
+        Rgba32Float = "rgba32float",
+        Bgra8Unorm = "bgra8unorm",
     }
-}
+);
 
-#[derive(Debug, Clone, Copy)]
-pub enum TextureFormat {
-    Rgba8Unorm,
-    Rgba8Snorm,
-    Rgba8Uint,
-    Rgba8Sint,
-    Rgba16Uint,
-    Rgba16Sint,
-    Rgba16Float,
-    R32Uint,
-    R32Sint,
-    R32Float,
-    Rg32Uint,
-    Rg32Sint,
-    Rg32Float,
-    Rgba32Uint,
-    Rgba32Sint,
-    Rgba32Float,
-    Bgra8Unorm,
-}
-
-impl TextureFormat {
-    pub fn from_str(text: &str) -> Option<TextureFormat> {
-        Some(match text {
-            "rgba8unorm" => TextureFormat::Rgba8Unorm,
-            "rgba8snorm" => TextureFormat::Rgba8Snorm,
-            "rgba8uint" => TextureFormat::Rgba8Uint,
-            "rgba8sint" => TextureFormat::Rgba8Sint,
-            "rgba16uint" => TextureFormat::Rgba16Uint,
-            "rgba16sint" => TextureFormat::Rgba16Sint,
-            "rgba16float" => TextureFormat::Rgba16Float,
-            "r32uint" => TextureFormat::R32Uint,
-            "r32sint" => TextureFormat::R32Sint,
-            "r32float" => TextureFormat::R32Float,
-            "rg32uint" => TextureFormat::Rg32Uint,
-            "rg32sint" => TextureFormat::Rg32Sint,
-            "rg32float" => TextureFormat::Rg32Float,
-            "rgba32uint" => TextureFormat::Rgba32Uint,
-            "rgba32sint" => TextureFormat::Rgba32Sint,
-            "rgba32float" => TextureFormat::Rgba32Float,
-            "bgra8unorm" => TextureFormat::Bgra8Unorm,
-            _ => return None,
-        })
+derive_enum!(
+    #[derive(Debug, Clone, Copy)]
+    pub enum AccessMode {
+        Read = "read",
+        Write = "write",
+        ReadWrite = "read_write",
     }
-
-    fn as_str(self) -> &'static str {
-        match self {
-            TextureFormat::Rgba8Unorm => "rgba8unorm",
-            TextureFormat::Rgba8Snorm => "rgba8snorm",
-            TextureFormat::Rgba8Uint => "rgba8uint",
-            TextureFormat::Rgba8Sint => "rgba8sint",
-            TextureFormat::Rgba16Uint => "rgba16uint",
-            TextureFormat::Rgba16Sint => "rgba16sint",
-            TextureFormat::Rgba16Float => "rgba16float",
-            TextureFormat::R32Uint => "r32uint",
-            TextureFormat::R32Sint => "r32sint",
-            TextureFormat::R32Float => "r32float",
-            TextureFormat::Rg32Uint => "rg32uint",
-            TextureFormat::Rg32Sint => "rg32sint",
-            TextureFormat::Rg32Float => "rg32float",
-            TextureFormat::Rgba32Uint => "rgba32uint",
-            TextureFormat::Rgba32Sint => "rgba32sint",
-            TextureFormat::Rgba32Float => "rgba32float",
-            TextureFormat::Bgra8Unorm => "bgra8unorm",
-        }
-    }
-}
-
-impl std::fmt::Display for TextureFormat {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.as_str().fmt(f)
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum AccessMode {
-    ReadOnly,
-    WriteOnly,
-    ReadWrite,
-}
-
-impl AccessMode {
-    pub fn from_str(text: &str) -> Option<AccessMode> {
-        Some(match text {
-            "read_only" => AccessMode::ReadOnly,
-            "write_only" => AccessMode::WriteOnly,
-            "read_write" => AccessMode::ReadWrite,
-            _ => return None,
-        })
-    }
-
-    fn as_str(self) -> &'static str {
-        match self {
-            AccessMode::ReadOnly => "read_only",
-            AccessMode::WriteOnly => "write_only",
-            AccessMode::ReadWrite => "read_write",
-        }
-    }
-}
-
-impl std::fmt::Display for AccessMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.as_str().fmt(f)
-    }
-}
+);

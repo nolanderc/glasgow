@@ -491,26 +491,22 @@ impl Tree {
         Ok(())
     }
 
-    pub fn enumerate_token_path_at_offset_utf8(
+    pub fn enumerate_token_path_in_range_utf8(
         &self,
-        offset: usize,
+        range: std::ops::Range<usize>,
         mut callback: impl FnMut(NodeIndex),
     ) -> bool {
         fn find_in_node(
             nodes: &[Node],
             curr: NodeIndex,
-            offset: usize,
+            range: std::ops::Range<usize>,
             callback: &mut impl FnMut(NodeIndex),
         ) -> bool {
             let node = nodes[curr.0 as usize];
 
             if node.tag.is_token() {
-                let range = node.byte_range();
-                let start = match node.tag {
-                    Tag::Identifier | Tag::Dot => range.start,
-                    _ => range.start + 1,
-                };
-                if start <= offset && offset <= range.end {
+                let node_range = node.byte_range();
+                if node_range.start < range.end && range.start < node_range.end {
                     callback(curr as NodeIndex);
                     return true;
                 } else {
@@ -523,19 +519,19 @@ impl Tree {
             for child in node.children().rev() {
                 let c = nodes[child.0 as usize];
                 if c.tag.is_token() {
-                    let range = c.byte_range();
-                    if range.end < offset {
+                    let node_range = c.byte_range();
+                    if node_range.end < range.start {
                         candidate_children.start = child.0 as usize + 1;
                         break;
                     }
-                    if offset < range.start {
+                    if range.end <= node_range.start {
                         candidate_children.end = child.0 as usize;
                     }
                 }
             }
 
             for child in candidate_children.rev() {
-                if find_in_node(nodes, NodeIndex(child as u32), offset, callback) {
+                if find_in_node(nodes, NodeIndex(child as u32), range.clone(), callback) {
                     callback(curr as NodeIndex);
                     return true;
                 }
@@ -544,12 +540,12 @@ impl Tree {
             false
         }
 
-        find_in_node(&self.nodes, self.root_index(), offset, &mut callback)
+        find_in_node(&self.nodes, self.root_index(), range, &mut callback)
     }
 
-    pub fn token_path_at_offset_utf8(&self, offset: usize) -> Vec<NodeIndex> {
+    pub fn token_path_in_range_utf8(&self, range: std::ops::Range<usize>) -> Vec<NodeIndex> {
         let mut path = Vec::new();
-        self.enumerate_token_path_at_offset_utf8(offset, |index| path.push(index));
+        self.enumerate_token_path_in_range_utf8(range, |index| path.push(index));
         path.reverse();
         path
     }

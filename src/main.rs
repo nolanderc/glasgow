@@ -128,7 +128,9 @@ fn add_routes(router: &mut Router) {
             .offset_utf8_from_position_utf16(location.position)
             .context("invalid position")?;
 
-        let Some((symbol, token)) = document.symbol_at_offset(offset) else { return Ok(None) };
+        let Some((symbol, token)) = document.symbol_in_range(offset..offset + 1) else {
+            return Ok(None);
+        };
 
         let parsed = document.parse();
         let range = parsed.tree.node(token).byte_range();
@@ -147,7 +149,7 @@ fn add_routes(router: &mut Router) {
             .offset_utf8_from_position_utf16(location.position)
             .context("invalid position")?;
 
-        let Some((symbols, _token)) = document.visible_symbols_at_offset(offset) else {
+        let Some((symbols, _token)) = document.visible_symbols_in_range(0..offset) else {
             return Ok(None);
         };
 
@@ -185,6 +187,11 @@ fn add_routes(router: &mut Router) {
                 analyze::Reference::BuiltinTypeAlias(_, _) => CompletionItemKind::CLASS,
                 analyze::Reference::BuiltinType(_) => CompletionItemKind::CLASS,
                 analyze::Reference::Swizzle(_, _) => CompletionItemKind::FIELD,
+                analyze::Reference::AccessMode(_)
+                | analyze::Reference::AddressSpace(_)
+                | analyze::Reference::TextureFormat(_)
+                | analyze::Reference::Attribute(_)
+                | analyze::Reference::AttributeBuiltin(_) => CompletionItemKind::KEYWORD,
             });
 
             completions.push(item);
@@ -199,7 +206,7 @@ fn add_routes(router: &mut Router) {
         let offset = document
             .offset_utf8_from_position_utf16(location.position)
             .context("invalid position")?;
-        let Some((symbol, _token)) = document.symbol_at_offset(offset) else {
+        let Some((symbol, _token)) = document.symbol_in_range(offset..offset + 1) else {
             return Ok(None);
         };
 
@@ -219,7 +226,7 @@ fn add_routes(router: &mut Router) {
             .offset_utf8_from_position_utf16(location.position)
             .context("invalid position")?;
 
-        let Some((symbol, _token)) = document.symbol_at_offset(offset) else {
+        let Some((symbol, _token)) = document.symbol_in_range(offset..offset + 1) else {
             return Ok(None);
         };
 
@@ -245,19 +252,13 @@ fn add_routes(router: &mut Router) {
             .offset_utf8_from_position_utf16(location.position)
             .context("invalid position")?;
 
-        let Some((symbol, _token)) = document.symbol_at_offset(offset) else {
+        let Some((symbol, _token)) = document.symbol_in_range(offset..offset + 1) else {
             return Ok(None);
         };
 
         match symbol.reference {
             analyze::Reference::User(_) => {},
-
-            analyze::Reference::BuiltinFunction(_)
-            | analyze::Reference::BuiltinTypeAlias(_, _)
-            | analyze::Reference::BuiltinType(_)
-            | analyze::Reference::Swizzle(_, _) => {
-                return Err(anyhow!("cannot rename builtin functions/types"))
-            },
+            _ => return Err(anyhow!("cannot rename builtin functions/types")),
         }
 
         let mut document_edits = Vec::new();
@@ -565,6 +566,66 @@ fn symbol_documentation(
             }
             writeln!(markdown, "```")?;
         },
+
+        analyze::Reference::AccessMode(mode) => match mode {
+            analyze::AccessMode::Read => writeln!(markdown, "read-only access")?,
+            analyze::AccessMode::Write => writeln!(markdown, "write-only access")?,
+            analyze::AccessMode::ReadWrite => writeln!(markdown, "read and write access")?,
+        },
+        analyze::Reference::AddressSpace(space) => {
+            match space {
+                analyze::AddressSpace::Function => {
+                    writeln!(
+                        markdown,
+                        "Address space for variables within the same function call."
+                    )?;
+                },
+                analyze::AddressSpace::Private => {
+                    writeln!(
+                        markdown,
+                        "Address space for variables within the same shader invocation."
+                    )?;
+                },
+                analyze::AddressSpace::Workgroup => {
+                    writeln!(
+                        markdown,
+                        "Address space for variables within the same compute shader workgroup."
+                    )?;
+                },
+                analyze::AddressSpace::Uniform => {
+                    writeln!(
+                        markdown,
+                        "Address space for uniform buffer variables within the same shader stage."
+                    )?;
+                },
+                analyze::AddressSpace::Storage => {
+                    writeln!(
+                        markdown,
+                        "Address space for storage buffer variables within the same shader stage."
+                    )?;
+                },
+                analyze::AddressSpace::Handle => {
+                    writeln!(
+                        markdown,
+                        "Address space for sampler and texture variables within the same shader stage."
+                    )?;
+                },
+            }
+
+            writeln!(markdown)?;
+            writeln!(markdown, "Default Access Mode: `{}`", space.default_access_mode())?;
+        },
+        analyze::Reference::TextureFormat(format) => {
+            writeln!(markdown, "Texture Format: `{}`", format)?;
+        },
+
+        analyze::Reference::Attribute(name) => {
+            writeln!(markdown, "`@{}`", name)?;
+        },
+
+        analyze::Reference::AttributeBuiltin(name) => {
+            writeln!(markdown, "`@builtin({})`", name)?;
+        },
     }
 
     Ok(lsp::MarkupContent { kind: lsp::MarkupKind::Markdown, value: markdown })
@@ -647,7 +708,7 @@ fn run_server(_arguments: Arguments, connection: lsp_server::Connection) -> Resu
         hover_provider: Some(lsp::HoverProviderCapability::Simple(true)),
         completion_provider: Some(lsp::CompletionOptions {
             resolve_provider: None,
-            trigger_characters: Some(vec![".".into()]),
+            trigger_characters: Some(vec![".".into(), "@".into()]),
             all_commit_characters: None,
             work_done_progress_options: Default::default(),
             completion_item: None,
