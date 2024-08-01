@@ -685,13 +685,13 @@ impl<'a> DocumentContext<'a> {
         typ: Option<syntax::TypeSpecifier>,
         value: Option<syntax::Expression>,
     ) {
+        self.resolve_references_maybe(typ);
+        self.resolve_references_maybe(value);
         if let Some(name) = name {
             let text = &self.source[name.byte_range()];
             self.scope.insert(text, node);
             self.references.insert(name.index(), Reference::User(node));
         }
-        self.resolve_references_maybe(typ);
-        self.resolve_references_maybe(value);
     }
 
     fn check_variable_decl_types(
