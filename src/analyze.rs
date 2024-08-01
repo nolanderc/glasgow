@@ -7,7 +7,8 @@ use std::{
 
 use crate::{
     parse,
-    syntax::{self, SyntaxNodeMatch},
+    syntax::{self, Extract as _, SyntaxNodeMatch},
+    workspace::{Document, DocumentId, Workspace},
 };
 
 static BUILTIN_FUNCTIONS: std::sync::OnceLock<wgsl_spec::FunctionInfo> = std::sync::OnceLock::new();
@@ -33,8 +34,8 @@ pub struct GlobalDeclaration {
 }
 
 impl GlobalDeclaration {
-    pub fn name(&self, tree: &parse::Tree) -> Option<syntax::Token!(Identifier)> {
-        self.node.name(tree)
+    pub fn name_in_tree(&self, tree: &parse::Tree) -> Option<syntax::Token!(Identifier)> {
+        self.node.name_in_tree(tree)
     }
 }
 
@@ -45,6 +46,7 @@ pub struct ErrorDuplicate {
 }
 
 pub fn collect_global_scope(
+    document: DocumentId,
     tree: &parse::Tree,
     source: &str,
 ) -> (GlobalScope, BTreeMap<String, ErrorDuplicate>) {
@@ -54,8 +56,8 @@ pub fn collect_global_scope(
     let mut errors = BTreeMap::new();
 
     for decl in root.decls(tree) {
-        let node = ReferenceNode::from(decl);
-        if let Some(name) = node.name(tree) {
+        let node = ReferenceNode::from_decl(document, decl);
+        if let Some(name) = node.name_in_tree(tree) {
             let text = &source[name.byte_range()];
             let global = GlobalDeclaration { node };
             if let Some(previous) = scope.insert(text.into(), global) {
@@ -71,10 +73,39 @@ pub fn collect_global_scope(
     (scope, errors)
 }
 
-pub struct Context<'a> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct WithDocument<T> {
+    pub document: DocumentId,
+    pub syntax: T,
+}
+
+impl<T> WithDocument<T>
+where
+    T: syntax::SyntaxNodeMatch,
+{
+    pub fn new(document: DocumentId, syntax: T) -> Self {
+        Self { document, syntax }
+    }
+}
+
+impl<T> WithDocument<T>
+where
+    T: syntax::Extract + Copy,
+{
+    pub fn extract(&self, workspace: &Workspace) -> T::Data {
+        let document = workspace.document_from_id(self.document);
+        let parsed = document.parse();
+        self.syntax.extract(&parsed.tree)
+    }
+}
+
+pub struct DocumentContext<'a> {
     builtin_functions: &'static wgsl_spec::FunctionInfo,
     builtin_tokens: &'static wgsl_spec::TokenInfo,
 
+    workspace: &'a Workspace,
+
+    document: &'a Document,
     global_scope: &'a GlobalScope,
     tree: &'a parse::Tree,
     source: &'a str,
@@ -128,9 +159,9 @@ pub enum Reference {
 }
 
 impl Reference {
-    pub fn name(&self, tree: &parse::Tree) -> Option<syntax::Token!(Identifier)> {
+    pub fn name(&self, workspace: &Workspace) -> Option<WithDocument<syntax::Token!(Identifier)>> {
         match self {
-            &Reference::User(node) => node.name(tree),
+            &Reference::User(node) => node.name(workspace),
             _ => None,
         }
     }
@@ -138,7 +169,7 @@ impl Reference {
     fn eq(&self, source: &Reference) -> bool {
         use Reference::*;
         match (self, source) {
-            (User(lhs), User(rhs)) => lhs.raw().index() == rhs.raw().index(),
+            (User(lhs), User(rhs)) => lhs.raw_syntax().index() == rhs.raw_syntax().index(),
             (&BuiltinFunction(lhs), &BuiltinFunction(rhs)) => std::ptr::eq(lhs, rhs),
             (&BuiltinTypeAlias(lhs, _), &BuiltinTypeAlias(rhs, _)) => std::ptr::eq(lhs, rhs),
             (&BuiltinType(lhs), &BuiltinType(rhs)) => std::ptr::eq(lhs, rhs),
@@ -150,60 +181,73 @@ impl Reference {
 
 #[derive(Debug, Clone, Copy)]
 pub enum ReferenceNode {
-    Alias(syntax::DeclAlias),
-    Const(syntax::DeclConst),
-    ConstAssert(syntax::DeclConstAssert),
-    Fn(syntax::DeclFn),
-    FnParameter(syntax::DeclFnParameter),
-    Let(syntax::StmtLet),
-    Override(syntax::DeclOverride),
-    Struct(syntax::DeclStruct),
-    StructField(syntax::DeclStructField),
-    Var(syntax::DeclVar),
-}
-
-impl From<syntax::Decl> for ReferenceNode {
-    fn from(decl: syntax::Decl) -> ReferenceNode {
-        match decl {
-            syntax::Decl::Alias(x) => ReferenceNode::Alias(x),
-            syntax::Decl::Const(x) => ReferenceNode::Const(x),
-            syntax::Decl::ConstAssert(x) => ReferenceNode::ConstAssert(x),
-            syntax::Decl::Fn(x) => ReferenceNode::Fn(x),
-            syntax::Decl::Override(x) => ReferenceNode::Override(x),
-            syntax::Decl::Struct(x) => ReferenceNode::Struct(x),
-            syntax::Decl::Var(x) => ReferenceNode::Var(x),
-        }
-    }
+    Alias(WithDocument<syntax::DeclAlias>),
+    Const(WithDocument<syntax::DeclConst>),
+    ConstAssert(WithDocument<syntax::DeclConstAssert>),
+    Fn(WithDocument<syntax::DeclFn>),
+    FnParameter(WithDocument<syntax::DeclFnParameter>),
+    Let(WithDocument<syntax::StmtLet>),
+    Override(WithDocument<syntax::DeclOverride>),
+    Struct(WithDocument<syntax::DeclStruct>),
+    StructField(WithDocument<syntax::DeclStructField>),
+    Var(WithDocument<syntax::DeclVar>),
 }
 
 impl ReferenceNode {
-    pub fn raw(self) -> syntax::SyntaxNode {
-        match self {
-            ReferenceNode::Alias(x) => x.node(),
-            ReferenceNode::Const(x) => x.node(),
-            ReferenceNode::ConstAssert(x) => x.node(),
-            ReferenceNode::Fn(x) => x.node(),
-            ReferenceNode::FnParameter(x) => x.node(),
-            ReferenceNode::Let(x) => x.node(),
-            ReferenceNode::Override(x) => x.node(),
-            ReferenceNode::Struct(x) => x.node(),
-            ReferenceNode::StructField(x) => x.node(),
-            ReferenceNode::Var(x) => x.node(),
+    pub fn from_decl(document: DocumentId, decl: syntax::Decl) -> ReferenceNode {
+        match decl {
+            syntax::Decl::Alias(x) => Self::Alias(WithDocument::new(document, x)),
+            syntax::Decl::Const(x) => Self::Const(WithDocument::new(document, x)),
+            syntax::Decl::ConstAssert(x) => Self::ConstAssert(WithDocument::new(document, x)),
+            syntax::Decl::Fn(x) => Self::Fn(WithDocument::new(document, x)),
+            syntax::Decl::Override(x) => Self::Override(WithDocument::new(document, x)),
+            syntax::Decl::Struct(x) => Self::Struct(WithDocument::new(document, x)),
+            syntax::Decl::Var(x) => Self::Var(WithDocument::new(document, x)),
         }
     }
 
-    pub fn name(self, tree: &parse::Tree) -> Option<syntax::Token!(Identifier)> {
+    pub fn raw(self) -> (DocumentId, syntax::SyntaxNode) {
         match self {
-            ReferenceNode::Alias(x) => x.extract(tree).name,
-            ReferenceNode::Const(x) => x.extract(tree).name,
-            ReferenceNode::ConstAssert(_) => None,
-            ReferenceNode::Fn(x) => x.extract(tree).name,
-            ReferenceNode::FnParameter(x) => x.extract(tree).name,
-            ReferenceNode::Let(x) => x.extract(tree).name,
-            ReferenceNode::Override(x) => x.extract(tree).name,
-            ReferenceNode::Struct(x) => x.extract(tree).name,
-            ReferenceNode::StructField(x) => x.extract(tree).name,
-            ReferenceNode::Var(x) => x.extract(tree).name,
+            Self::Alias(x) => (x.document, x.syntax.node()),
+            Self::Const(x) => (x.document, x.syntax.node()),
+            Self::ConstAssert(x) => (x.document, x.syntax.node()),
+            Self::Fn(x) => (x.document, x.syntax.node()),
+            Self::FnParameter(x) => (x.document, x.syntax.node()),
+            Self::Let(x) => (x.document, x.syntax.node()),
+            Self::Override(x) => (x.document, x.syntax.node()),
+            Self::Struct(x) => (x.document, x.syntax.node()),
+            Self::StructField(x) => (x.document, x.syntax.node()),
+            Self::Var(x) => (x.document, x.syntax.node()),
+        }
+    }
+
+    pub fn document(self) -> DocumentId {
+        self.raw().0
+    }
+
+    pub fn raw_syntax(self) -> syntax::SyntaxNode {
+        self.raw().1
+    }
+
+    pub fn name(self, workspace: &Workspace) -> Option<WithDocument<syntax::Token!(Identifier)>> {
+        let id = self.document();
+        let document = workspace.document_from_id(id);
+        let token = self.name_in_tree(&document.parse().tree)?;
+        Some(WithDocument::new(id, token))
+    }
+
+    pub fn name_in_tree(self, tree: &parse::Tree) -> Option<syntax::Token!(Identifier)> {
+        match self {
+            Self::Alias(x) => x.syntax.extract(tree).name,
+            Self::Const(x) => x.syntax.extract(tree).name,
+            Self::ConstAssert(_) => None,
+            Self::Fn(x) => x.syntax.extract(tree).name,
+            Self::FnParameter(x) => x.syntax.extract(tree).name,
+            Self::Let(x) => x.syntax.extract(tree).name,
+            Self::Override(x) => x.syntax.extract(tree).name,
+            Self::Struct(x) => x.syntax.extract(tree).name,
+            Self::StructField(x) => x.syntax.extract(tree).name,
+            Self::Var(x) => x.syntax.extract(tree).name,
         }
     }
 }
@@ -225,15 +269,18 @@ pub struct ErrorUnresolvedReference {
     pub node: syntax::Token!(Identifier),
 }
 
-impl<'a> Context<'a> {
-    pub fn new(global_scope: &'a GlobalScope, tree: &'a parse::Tree, source: &'a str) -> Self {
+impl<'a> DocumentContext<'a> {
+    pub fn new(workspace: &'a Workspace, document: &'a Document) -> Self {
         let mut context = Self {
             builtin_functions: get_builtin_functions(),
             builtin_tokens: get_builtin_tokens(),
 
-            global_scope,
-            tree,
-            source,
+            workspace,
+
+            document,
+            global_scope: &document.global_scope().symbols,
+            tree: &document.parse().tree,
+            source: document.content(),
             scope: Scope::new(),
             errors: Vec::new().into(),
 
@@ -518,7 +565,7 @@ impl<'a> Context<'a> {
                 let konst = syntax::DeclConst::new(syntax::SyntaxNode::new(node, index)).unwrap();
                 let data = konst.extract(self.tree);
                 self.resolve_variable_declaration(
-                    ReferenceNode::Const(konst),
+                    ReferenceNode::Const(WithDocument::new(self.document.id(), konst)),
                     data.name,
                     data.typ,
                     data.value,
@@ -528,7 +575,7 @@ impl<'a> Context<'a> {
                 let war = syntax::DeclVar::new(syntax::SyntaxNode::new(node, index)).unwrap();
                 let data = war.extract(self.tree);
                 self.resolve_variable_declaration(
-                    ReferenceNode::Var(war),
+                    ReferenceNode::Var(WithDocument::new(self.document.id(), war)),
                     data.name,
                     data.typ,
                     data.value,
@@ -538,7 +585,7 @@ impl<'a> Context<'a> {
                 let lett = syntax::StmtLet::new(syntax::SyntaxNode::new(node, index)).unwrap();
                 let data = lett.extract(self.tree);
                 self.resolve_variable_declaration(
-                    ReferenceNode::Let(lett),
+                    ReferenceNode::Let(WithDocument::new(self.document.id(), lett)),
                     data.name,
                     data.typ,
                     data.value,
@@ -551,8 +598,13 @@ impl<'a> Context<'a> {
                 let data = field.extract(self.tree);
                 self.resolve_references_maybe(data.attributes);
                 if let Some(name) = data.name {
-                    self.references
-                        .insert(name.index(), Reference::User(ReferenceNode::StructField(field)));
+                    self.references.insert(
+                        name.index(),
+                        Reference::User(ReferenceNode::StructField(WithDocument::new(
+                            self.document.id(),
+                            field,
+                        ))),
+                    );
                 }
                 self.resolve_references_maybe(data.typ);
             },
@@ -562,7 +614,7 @@ impl<'a> Context<'a> {
                     syntax::DeclFnParameter::new(syntax::SyntaxNode::new(node, index)).unwrap();
                 let data = param.extract(self.tree);
                 self.resolve_variable_declaration(
-                    ReferenceNode::FnParameter(param),
+                    ReferenceNode::FnParameter(WithDocument::new(self.document.id(), param)),
                     data.name,
                     data.typ,
                     None,
@@ -874,7 +926,7 @@ impl<'a> Context<'a> {
                     },
 
                     Type::Fn(func) => {
-                        let data = func.extract(self.tree);
+                        let data = func.extract(self.workspace);
                         let spec = data.output?.extract(self.tree).typ?;
                         self.type_from_specifier(spec, self.tree, self.source)
                             .map(Type::unwrap_inner)
@@ -959,15 +1011,19 @@ impl<'a> Context<'a> {
                             }
                         },
                         Type::Struct(strukt) => {
-                            let data = strukt.extract(self.tree);
+                            let document = self.workspace.document_from_id(strukt.document);
+                            let tree = &document.parse().tree;
+                            let data = strukt.syntax.extract(tree);
                             if let Some(fields) = data.fields {
-                                for field in fields.fields(self.tree) {
-                                    let data_field = field.extract(self.tree);
+                                for field in fields.fields(tree) {
+                                    let data_field = field.extract(tree);
                                     if let Some(name) = data_field.name {
-                                        let text = &self.source[name.byte_range()];
+                                        let text = &document.content()[name.byte_range()];
                                         self.capture.references.push((
                                             text.into(),
-                                            Reference::User(ReferenceNode::StructField(field)),
+                                            Reference::User(ReferenceNode::StructField(
+                                                WithDocument::new(strukt.document, field),
+                                            )),
                                         ));
                                     }
                                 }
@@ -1003,17 +1059,21 @@ impl<'a> Context<'a> {
                         typ
                     },
                     Type::Struct(strukt) => {
-                        let data = strukt.extract(self.tree);
+                        let document = self.workspace.document_from_id(strukt.document);
+                        let tree = &document.parse().tree;
+                        let data = strukt.syntax.extract(tree);
                         let fields = data.fields?;
-                        for field in fields.fields(self.tree) {
-                            let data_field = field.extract(self.tree);
+                        for field in fields.fields(tree) {
+                            let data_field = field.extract(tree);
                             if let Some(field_name) = data_field.name {
-                                let field_text = &self.source[field_name.byte_range()];
+                                let field_text = &document.content()[field_name.byte_range()];
                                 if field_text == member_text {
                                     let spec = data_field.typ?;
                                     self.references.insert(
                                         member.index(),
-                                        Reference::User(ReferenceNode::StructField(field)),
+                                        Reference::User(ReferenceNode::StructField(
+                                            WithDocument::new(strukt.document, field),
+                                        )),
                                     );
                                     let typ = self
                                         .type_from_specifier(spec, self.tree, self.source)
@@ -1330,33 +1390,35 @@ impl<'a> Context<'a> {
                 ReferenceNode::ConstAssert(_) => None,
 
                 ReferenceNode::Alias(alias) => {
-                    let spec = alias.extract(self.tree).typ?;
-                    self.type_from_specifier(spec, self.tree, self.source)
+                    let document = self.workspace.document_from_id(alias.document);
+                    let tree = &document.parse().tree;
+                    let spec = alias.syntax.extract(tree).typ?;
+                    self.type_from_specifier(spec, tree, document.content())
                 },
 
                 ReferenceNode::StructField(field) => {
-                    let data = field.extract(self.tree);
-                    self.type_of_variable(data.typ, None)
+                    let data = field.extract(self.workspace);
+                    self.type_of_variable(field.document, data.typ, None)
                 },
                 ReferenceNode::Const(konst) => {
-                    let data = konst.extract(self.tree);
-                    self.type_of_variable(data.typ, data.value)
+                    let data = konst.extract(self.workspace);
+                    self.type_of_variable(konst.document, data.typ, data.value)
                 },
                 ReferenceNode::Override(overide) => {
-                    let data = overide.extract(self.tree);
-                    self.type_of_variable(data.typ, data.value)
+                    let data = overide.extract(self.workspace);
+                    self.type_of_variable(overide.document, data.typ, data.value)
                 },
                 ReferenceNode::Var(war) => {
-                    let data = war.extract(self.tree);
-                    self.type_of_variable(data.typ, data.value)
+                    let data = war.extract(self.workspace);
+                    self.type_of_variable(war.document, data.typ, data.value)
                 },
                 ReferenceNode::FnParameter(param) => {
-                    let data = param.extract(self.tree);
-                    self.type_of_variable(data.typ, None)
+                    let data = param.extract(self.workspace);
+                    self.type_of_variable(param.document, data.typ, None)
                 },
                 ReferenceNode::Let(lett) => {
-                    let data = lett.extract(self.tree);
-                    self.type_of_variable(data.typ, data.value)
+                    let data = lett.extract(self.workspace);
+                    self.type_of_variable(lett.document, data.typ, data.value)
                 },
             },
 
@@ -1381,13 +1443,19 @@ impl<'a> Context<'a> {
 
     fn type_of_variable(
         &mut self,
+        document_id: DocumentId,
         spec: Option<syntax::TypeSpecifier>,
         value: Option<syntax::Expression>,
     ) -> Option<Type> {
         if let Some(spec) = spec {
-            self.type_from_specifier(spec, self.tree, self.source).map(Type::unwrap_inner)
-        } else {
+            let document = self.workspace.document_from_id(document_id);
+            let tree = &document.parse().tree;
+            self.type_from_specifier(spec, tree, document.content()).map(Type::unwrap_inner)
+        } else if document_id == self.document.id() {
             self.infer_type_expr(value?)
+        } else {
+            // TODO: consider creating a new child context to analyze the body
+            None
         }
     }
 
@@ -1739,8 +1807,8 @@ pub enum Type {
     Mat(u8, u8, Option<TypeScalar>),
     Atomic(Option<TypeScalar>),
     Array(Option<Rc<Type>>, Option<NonZeroU32>),
-    Struct(syntax::DeclStruct),
-    Fn(syntax::DeclFn),
+    Struct(WithDocument<syntax::DeclStruct>),
+    Fn(WithDocument<syntax::DeclFn>),
 
     Ptr(Option<AddressSpace>, Option<Rc<Type>>, Option<AccessMode>),
 
@@ -1775,12 +1843,7 @@ impl Type {
         }
     }
 
-    pub fn fmt<F: std::fmt::Write>(
-        &self,
-        f: &mut F,
-        tree: &parse::Tree,
-        source: &str,
-    ) -> std::fmt::Result {
+    pub fn fmt<F: std::fmt::Write>(&self, f: &mut F, workspace: &Workspace) -> std::fmt::Result {
         struct Maybe<'a, T>(&'a Option<T>);
 
         impl<T: std::fmt::Display> std::fmt::Display for Maybe<'_, T> {
@@ -1794,7 +1857,7 @@ impl Type {
 
         let type_maybe = |f: &mut F, typ: &Option<Rc<Type>>| -> std::fmt::Result {
             if let Some(typ) = typ {
-                Type::fmt(typ, f, tree, source)
+                Type::fmt(typ, f, workspace)
             } else {
                 write!(f, "_")
             }
@@ -1803,7 +1866,7 @@ impl Type {
         match self {
             Type::Type(inner) => {
                 write!(f, "type<")?;
-                inner.fmt(f, tree, source)?;
+                inner.fmt(f, workspace)?;
                 write!(f, ">")?;
                 Ok(())
             },
@@ -1837,12 +1900,18 @@ impl Type {
             },
 
             Type::Struct(strukt) => {
-                let Some(name) = strukt.extract(tree).name else { return write!(f, "?struct?") };
-                write!(f, "{}", &source[name.byte_range()])
+                let document = workspace.document_from_id(strukt.document);
+                let Some(name) = strukt.syntax.extract(&document.parse().tree).name else {
+                    return write!(f, "?struct?");
+                };
+                write!(f, "{}", &document.content()[name.byte_range()])
             },
             Type::Fn(func) => {
-                let Some(name) = func.extract(tree).name else { return write!(f, "?fn?") };
-                write!(f, "{}", &source[name.byte_range()])
+                let document = workspace.document_from_id(func.document);
+                let Some(name) = func.syntax.extract(&document.parse().tree).name else {
+                    return write!(f, "?fn?");
+                };
+                write!(f, "{}", &document.content()[name.byte_range()])
             },
 
             Type::Sampler => write!(f, "sampler"),

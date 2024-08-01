@@ -5,28 +5,30 @@ use std::{
 
 use anyhow::{Context, Result};
 
-use crate::{analyze, syntax::SyntaxNodeMatch as _};
+use crate::{
+    analyze,
+    arena::{Arena, Handle},
+    syntax::SyntaxNodeMatch as _,
+};
 
 #[derive(Default)]
 pub struct Workspace {
-    pub documents: BTreeMap<lsp::Uri, Document>,
+    document_ids: BTreeMap<lsp::Uri, DocumentId>,
+    documents: Arena<Document>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DocumentId(Handle<Document>);
+
 impl Workspace {
-    pub(crate) fn document(&self, uri: &lsp::Uri) -> Result<&Document> {
-        self.documents
-            .get(uri)
-            .with_context(|| format!("no such open document: {:?}", uri.as_str()))
-    }
-
-    pub(crate) fn document_mut(&mut self, uri: &lsp::Uri) -> Result<&mut Document> {
-        self.documents
-            .get_mut(uri)
-            .with_context(|| format!("no such open document: {:?}", uri.as_str()))
-    }
-
     pub(crate) fn create_document(&mut self, new: lsp::TextDocumentItem) -> &mut Document {
-        let document = self.documents.entry(new.uri).or_default();
+        let id = *self.document_ids.entry(new.uri).or_insert_with(|| {
+            DocumentId(
+                self.documents.insert_with_handle(|handle| Document::new(DocumentId(handle))),
+            )
+        });
+
+        let document = &mut self.documents[id.0];
         document.content = new.text;
         document.version = Some(new.version);
         document.language = DocumentLanguage::from_str(&new.language_id);
@@ -35,12 +37,38 @@ impl Workspace {
     }
 
     pub(crate) fn remove_document(&mut self, text_document: lsp::TextDocumentIdentifier) {
-        self.documents.remove(&text_document.uri);
+        let Some(id) = self.document_ids.remove(&text_document.uri) else { return };
+        self.documents.remove(id.0);
+    }
+
+    pub(crate) fn document_mut(&mut self, uri: &lsp::Uri) -> Result<&mut Document> {
+        let id = *self
+            .document_ids
+            .get_mut(uri)
+            .with_context(|| format!("no such open document: {:?}", uri.as_str()))?;
+        Ok(&mut self.documents[id.0])
+    }
+
+    pub(crate) fn document(&self, uri: &lsp::Uri) -> Result<&Document> {
+        let id = *self
+            .document_ids
+            .get(uri)
+            .with_context(|| format!("no such open document: {:?}", uri.as_str()))?;
+        Ok(&self.documents[id.0])
+    }
+
+    pub(crate) fn document_from_id(&self, id: DocumentId) -> &Document {
+        &self.documents[id.0]
+    }
+
+    pub fn format_type<'a>(&'a self, typ: &'a crate::analyze::Type) -> impl std::fmt::Display + 'a {
+        crate::util::fmt_from_fn(move |f| typ.fmt(f, self))
     }
 }
 
-#[derive(Default)]
 pub struct Document {
+    id: DocumentId,
+
     content: String,
     version: Option<DocumentVersion>,
     language: Option<DocumentLanguage>,
@@ -57,9 +85,16 @@ pub struct GlobalScopeOutput {
 }
 
 impl Document {
-    #[cfg(test)]
-    pub fn new(content: String) -> Document {
-        Document { content, ..Default::default() }
+    pub fn new(id: DocumentId) -> Document {
+        Document {
+            id,
+            content: Default::default(),
+            version: None,
+            language: None,
+            parser: Default::default(),
+            parser_output: Default::default(),
+            global_scope: Default::default(),
+        }
     }
 
     /// Called when the document contents change.
@@ -91,6 +126,10 @@ impl Document {
                 Ok(())
             },
         }
+    }
+
+    pub fn id(&self) -> DocumentId {
+        self.id
     }
 
     pub fn version(&self) -> Option<i32> {
@@ -193,13 +232,14 @@ impl Document {
         self.global_scope.get_or_init(|| {
             let parsed = self.parse();
             let (symbols, errors) =
-                crate::analyze::collect_global_scope(&parsed.tree, self.content());
+                crate::analyze::collect_global_scope(self.id, &parsed.tree, self.content());
             GlobalScopeOutput { symbols, errors }
         })
     }
 
     pub fn symbol_in_range(
         &self,
+        workspace: &Workspace,
         range: std::ops::Range<usize>,
     ) -> Option<(crate::analyze::ResolvedSymbol, crate::parse::NodeIndex)> {
         let parsed = self.parse();
@@ -211,8 +251,7 @@ impl Document {
         let decl_index = *token_path.get(1)?;
         let decl = crate::syntax::Decl::from_tree(&parsed.tree, decl_index)?;
 
-        let global_scope = &self.global_scope().symbols;
-        let mut context = analyze::Context::new(global_scope, &parsed.tree, &self.content);
+        let mut context = analyze::DocumentContext::new(workspace, self);
         context.analyze_decl(decl);
 
         Some((context.get_node_symbol(token)?, token))
@@ -220,6 +259,7 @@ impl Document {
 
     pub fn visible_symbols_in_range(
         &self,
+        workspace: &Workspace,
         range: std::ops::Range<usize>,
     ) -> Option<(Vec<crate::analyze::ResolvedSymbol>, crate::parse::NodeIndex)> {
         let parsed = self.parse();
@@ -231,8 +271,7 @@ impl Document {
         let decl_index = *token_path.get(1)?;
         let decl = crate::syntax::Decl::from_tree(&parsed.tree, decl_index)?;
 
-        let global_scope = &self.global_scope().symbols;
-        let mut context = analyze::Context::new(global_scope, &parsed.tree, &self.content);
+        let mut context = analyze::DocumentContext::new(workspace, self);
 
         let mut options = analyze::CaptureOptions::default();
         for &index in token_path.iter() {
@@ -252,19 +291,13 @@ impl Document {
         Some((symbols, token))
     }
 
-    pub fn format_type<'a>(&'a self, typ: &'a crate::analyze::Type) -> impl std::fmt::Display + 'a {
-        let tree = &self.parse().tree;
-        let source = self.content();
-        crate::util::fmt_from_fn(move |f| typ.fmt(f, tree, source))
-    }
-
     pub(crate) fn find_all_references(
         &self,
+        workspace: &Workspace,
         reference: &analyze::Reference,
     ) -> Vec<crate::parse::NodeIndex> {
         let parsed = self.parse();
-        let global_scope = &self.global_scope().symbols;
-        let mut context = analyze::Context::new(global_scope, &parsed.tree, &self.content);
+        let mut context = analyze::DocumentContext::new(workspace, self);
         for decl in crate::syntax::root(&parsed.tree).decls(&parsed.tree) {
             context.analyze_decl(decl);
         }
@@ -296,7 +329,14 @@ mod tests {
 
     #[test]
     fn utf8_offset() {
-        let document = Document::new("abc\n123\nfn main() {}\n".into());
+        let mut workspace = Workspace::default();
+        let document = workspace.create_document(lsp::TextDocumentItem {
+            uri: "file://foo".parse().unwrap(),
+            language_id: "wgsl".into(),
+            version: 0,
+            text: "abc\n123\nfn main() {}\n".into(),
+        });
+
         let check_utf8_from_utf16 = |(line, character), expected: Option<usize>| {
             let position = lsp::Position::new(line, character);
             let offset = document.offset_utf8_from_position_utf16(position);

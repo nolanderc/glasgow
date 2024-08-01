@@ -48,6 +48,11 @@ pub trait SyntaxNodeMatch: Sized {
     }
 }
 
+pub trait Extract {
+    type Data;
+    fn extract(self, tree: &Tree) -> Self::Data;
+}
+
 macro_rules! syntax_node_simple {
     ( $name:ident ) => {
         #[derive(Debug, Clone, Copy)]
@@ -79,8 +84,9 @@ macro_rules! syntax_node_simple {
         }
 
         #[allow(dead_code)]
-        impl $name {
-            pub fn extract(self, tree: &Tree) -> $extracted {
+        impl Extract for $name {
+            type Data = $extracted;
+            fn extract(self, tree: &Tree) -> $extracted {
                 let mut children = self.0.children(tree).peekable();
                 $( let $field = try_extract::<$fieldty>(&mut children); )*
                 $extracted { $( $field ),* }

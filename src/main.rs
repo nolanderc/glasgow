@@ -1,4 +1,5 @@
 mod analyze;
+mod arena;
 mod format;
 mod parse;
 mod syntax;
@@ -15,7 +16,7 @@ use std::{
 use anyhow::{anyhow, Context as _, Result};
 use lsp::{notification::Notification as _, CompletionItemKind};
 
-use crate::syntax::SyntaxNodeMatch;
+use crate::syntax::{Extract as _, SyntaxNodeMatch};
 
 #[derive(Debug, clap::Parser)]
 #[clap(version, author, about)]
@@ -134,13 +135,14 @@ fn add_routes(router: &mut Router) {
             .offset_utf8_from_position_utf16(location.position)
             .context("invalid position")?;
 
-        let Some((symbol, token)) = document.symbol_in_range(offset..offset + 1) else {
+        let Some((symbol, token)) = document.symbol_in_range(&state.workspace, offset..offset + 1)
+        else {
             return Ok(None);
         };
 
         let parsed = document.parse();
         let range = parsed.tree.node(token).byte_range();
-        let documentation = symbol_documentation(document, &symbol, true)?;
+        let documentation = symbol_documentation(&state.workspace, &symbol, true)?;
 
         Ok(Some(lsp::Hover {
             range: document.range_utf16_from_range_utf8(range),
@@ -155,19 +157,21 @@ fn add_routes(router: &mut Router) {
             .offset_utf8_from_position_utf16(location.position)
             .context("invalid position")?;
 
-        let Some((symbols, _token)) = document.visible_symbols_in_range(0..offset) else {
+        let Some((symbols, _token)) =
+            document.visible_symbols_in_range(&state.workspace, 0..offset)
+        else {
             return Ok(None);
         };
 
         let mut completions = Vec::with_capacity(symbols.len());
 
         for symbol in symbols {
-            let documentation = symbol_documentation(document, &symbol, false)?;
+            let documentation = symbol_documentation(&state.workspace, &symbol, false)?;
             let mut item = lsp::CompletionItem {
                 label: symbol.name,
                 documentation: Some(lsp::Documentation::MarkupContent(documentation)),
                 label_details: symbol.typ.as_ref().map(|typ| lsp::CompletionItemLabelDetails {
-                    detail: Some(format!(": {}", document.format_type(typ))),
+                    detail: Some(format!(": {}", state.workspace.format_type(typ))),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -210,20 +214,24 @@ fn add_routes(router: &mut Router) {
 
     router.handle_request::<lsp::request::GotoDefinition>(|state, request| {
         let location = request.text_document_position_params;
-        let document = state.workspace.document(&location.text_document.uri)?;
-        let offset = document
+        let source_document = state.workspace.document(&location.text_document.uri)?;
+        let offset = source_document
             .offset_utf8_from_position_utf16(location.position)
             .context("invalid position")?;
-        let Some((symbol, _token)) = document.symbol_in_range(offset..offset + 1) else {
+
+        let Some((symbol, _token)) =
+            source_document.symbol_in_range(&state.workspace, offset..offset + 1)
+        else {
             return Ok(None);
         };
 
-        let Some(name) = symbol.reference.name(&document.parse().tree) else { return Ok(None) };
-        let range = name.byte_range();
+        let Some(name) = symbol.reference.name(&state.workspace) else { return Ok(None) };
+
+        let range = name.syntax.byte_range();
 
         Ok(Some(lsp::GotoDefinitionResponse::Scalar(lsp::Location {
             uri: location.text_document.uri,
-            range: document.range_utf16_from_range_utf8(range).unwrap(),
+            range: source_document.range_utf16_from_range_utf8(range).unwrap(),
         })))
     });
 
@@ -234,12 +242,13 @@ fn add_routes(router: &mut Router) {
             .offset_utf8_from_position_utf16(location.position)
             .context("invalid position")?;
 
-        let Some((symbol, _token)) = document.symbol_in_range(offset..offset + 1) else {
+        let Some((symbol, _token)) = document.symbol_in_range(&state.workspace, offset..offset + 1)
+        else {
             return Ok(None);
         };
 
         let parsed = document.parse();
-        let references = document.find_all_references(&symbol.reference);
+        let references = document.find_all_references(&state.workspace, &symbol.reference);
 
         let mut locations = Vec::with_capacity(references.len());
         for reference in references {
@@ -260,7 +269,8 @@ fn add_routes(router: &mut Router) {
             .offset_utf8_from_position_utf16(location.position)
             .context("invalid position")?;
 
-        let Some((symbol, _token)) = document.symbol_in_range(offset..offset + 1) else {
+        let Some((symbol, _token)) = document.symbol_in_range(&state.workspace, offset..offset + 1)
+        else {
             return Ok(None);
         };
 
@@ -271,7 +281,7 @@ fn add_routes(router: &mut Router) {
 
         let mut document_edits = Vec::new();
 
-        let references = document.find_all_references(&symbol.reference);
+        let references = document.find_all_references(&state.workspace, &symbol.reference);
         let parsed = document.parse();
 
         for reference in references {
@@ -353,7 +363,7 @@ fn collect_diagnostics(state: &State, uri: &lsp::Uri) -> Result<Vec<lsp::Diagnos
     let global_scope = document.global_scope();
     for (name, duplicate) in global_scope.errors.iter() {
         for conflict in duplicate.conflicts.iter() {
-            let Some(ident) = conflict.name(&parsed.tree) else { continue };
+            let Some(ident) = conflict.name_in_tree(&parsed.tree) else { continue };
             diagnostics.push(lsp::Diagnostic {
                 range: document.range_utf16_from_range_utf8(ident.byte_range()).unwrap(),
                 severity: Some(lsp::DiagnosticSeverity::ERROR),
@@ -363,8 +373,8 @@ fn collect_diagnostics(state: &State, uri: &lsp::Uri) -> Result<Vec<lsp::Diagnos
         }
     }
 
-    let mut context =
-        crate::analyze::Context::new(&global_scope.symbols, &parsed.tree, document.content());
+    let mut context = crate::analyze::DocumentContext::new(&state.workspace, document);
+
     for decl in syntax::root(&parsed.tree).decls(&parsed.tree) {
         let errors = std::mem::take(context.analyze_decl(decl));
         for error in errors {
@@ -389,7 +399,7 @@ fn collect_diagnostics(state: &State, uri: &lsp::Uri) -> Result<Vec<lsp::Diagnos
                         severity: Some(lsp::DiagnosticSeverity::ERROR),
                         message: format!(
                             "cannot call value of type `{}`",
-                            document.format_type(typ)
+                            state.workspace.format_type(typ)
                         ),
                         ..Default::default()
                     });
@@ -403,7 +413,7 @@ fn collect_diagnostics(state: &State, uri: &lsp::Uri) -> Result<Vec<lsp::Diagnos
                         severity: Some(lsp::DiagnosticSeverity::ERROR),
                         message: format!(
                             "cannot index into value of type `{}`",
-                            document.format_type(typ)
+                            state.workspace.format_type(typ)
                         ),
                         ..Default::default()
                     });
@@ -415,7 +425,10 @@ fn collect_diagnostics(state: &State, uri: &lsp::Uri) -> Result<Vec<lsp::Diagnos
                     diagnostics.push(lsp::Diagnostic {
                         range: document.range_utf16_from_range_utf8(range).unwrap(),
                         severity: Some(lsp::DiagnosticSeverity::ERROR),
-                        message: format!("invalid index type `{}`", document.format_type(typ)),
+                        message: format!(
+                            "invalid index type `{}`",
+                            state.workspace.format_type(typ)
+                        ),
                         ..Default::default()
                     });
                 },
@@ -428,7 +441,7 @@ fn collect_diagnostics(state: &State, uri: &lsp::Uri) -> Result<Vec<lsp::Diagnos
                         severity: Some(lsp::DiagnosticSeverity::ERROR),
                         message: format!(
                             "could not find field for type `{}`",
-                            document.format_type(typ)
+                            state.workspace.format_type(typ)
                         ),
                         ..Default::default()
                     });
@@ -441,7 +454,7 @@ fn collect_diagnostics(state: &State, uri: &lsp::Uri) -> Result<Vec<lsp::Diagnos
                         message: format!(
                             "cannot apply operator `{}` to type `{}`",
                             &document.content()[range],
-                            document.format_type(typ)
+                            state.workspace.format_type(typ)
                         ),
                         ..Default::default()
                     });
@@ -454,8 +467,8 @@ fn collect_diagnostics(state: &State, uri: &lsp::Uri) -> Result<Vec<lsp::Diagnos
                         message: format!(
                             "cannot apply operator {} to types `{}` and `{}`",
                             &document.content()[range],
-                            document.format_type(lhs),
-                            document.format_type(rhs),
+                            state.workspace.format_type(lhs),
+                            state.workspace.format_type(rhs),
                         ),
                         ..Default::default()
                     });
@@ -467,8 +480,8 @@ fn collect_diagnostics(state: &State, uri: &lsp::Uri) -> Result<Vec<lsp::Diagnos
                         severity: Some(lsp::DiagnosticSeverity::ERROR),
                         message: format!(
                             "incompatible types `{}` and `{}`",
-                            document.format_type(lhs),
-                            document.format_type(rhs),
+                            state.workspace.format_type(lhs),
+                            state.workspace.format_type(rhs),
                         ),
                         ..Default::default()
                     });
@@ -481,7 +494,7 @@ fn collect_diagnostics(state: &State, uri: &lsp::Uri) -> Result<Vec<lsp::Diagnos
 }
 
 fn symbol_documentation(
-    document: &workspace::Document,
+    workspace: &workspace::Workspace,
     symbol: &analyze::ResolvedSymbol,
     with_type_info: bool,
 ) -> Result<lsp::MarkupContent> {
@@ -492,19 +505,20 @@ fn symbol_documentation(
     if with_type_info {
         if let Some(typ) = &symbol.typ {
             writeln!(markdown, "```wgsl")?;
-            writeln!(markdown, ": {}", document.format_type(typ))?;
+            writeln!(markdown, ": {}", workspace.format_type(typ))?;
             writeln!(markdown, "```")?;
         }
     }
 
     match &symbol.reference {
         &analyze::Reference::User(node) => {
+            let document = workspace.document_from_id(node.document());
             let tree = &document.parse().tree;
 
             let snippet_range = match node {
                 analyze::ReferenceNode::Fn(func) => {
-                    let data = func.extract(tree);
-                    let mut children = func.parse_node().children();
+                    let data = func.syntax.extract(tree);
+                    let mut children = func.syntax.parse_node().children();
 
                     if data.body.is_some() {
                         // discard from snippet
@@ -513,15 +527,15 @@ fn symbol_documentation(
 
                     tree.byte_range_total_children(children)
                 },
-                analyze::ReferenceNode::Alias(x) => tree.byte_range_total(x.index()),
-                analyze::ReferenceNode::Const(x) => tree.byte_range_total(x.index()),
-                analyze::ReferenceNode::ConstAssert(x) => tree.byte_range_total(x.index()),
-                analyze::ReferenceNode::FnParameter(x) => tree.byte_range_total(x.index()),
-                analyze::ReferenceNode::Let(x) => tree.byte_range_total(x.index()),
-                analyze::ReferenceNode::Override(x) => tree.byte_range_total(x.index()),
-                analyze::ReferenceNode::Struct(x) => tree.byte_range_total(x.index()),
-                analyze::ReferenceNode::StructField(x) => tree.byte_range_total(x.index()),
-                analyze::ReferenceNode::Var(x) => tree.byte_range_total(x.index()),
+                analyze::ReferenceNode::Alias(x) => tree.byte_range_total(x.syntax.index()),
+                analyze::ReferenceNode::Const(x) => tree.byte_range_total(x.syntax.index()),
+                analyze::ReferenceNode::ConstAssert(x) => tree.byte_range_total(x.syntax.index()),
+                analyze::ReferenceNode::FnParameter(x) => tree.byte_range_total(x.syntax.index()),
+                analyze::ReferenceNode::Let(x) => tree.byte_range_total(x.syntax.index()),
+                analyze::ReferenceNode::Override(x) => tree.byte_range_total(x.syntax.index()),
+                analyze::ReferenceNode::Struct(x) => tree.byte_range_total(x.syntax.index()),
+                analyze::ReferenceNode::StructField(x) => tree.byte_range_total(x.syntax.index()),
+                analyze::ReferenceNode::Var(x) => tree.byte_range_total(x.syntax.index()),
             };
 
             if let Some(range) = snippet_range {
@@ -559,18 +573,13 @@ fn symbol_documentation(
         },
 
         analyze::Reference::Swizzle(count, scalar) => {
-            let parsed = document.parse();
             writeln!(markdown, "```wgsl")?;
             if *count == 1 {
                 if let Some(scalar) = scalar {
                     writeln!(markdown, "{scalar}")?;
                 }
             } else {
-                analyze::Type::Vec(*count, *scalar).fmt(
-                    &mut markdown,
-                    &parsed.tree,
-                    document.content(),
-                )?;
+                analyze::Type::Vec(*count, *scalar).fmt(&mut markdown, workspace)?;
                 writeln!(markdown)?;
             }
             writeln!(markdown, "```")?;
