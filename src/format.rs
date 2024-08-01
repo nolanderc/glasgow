@@ -370,6 +370,11 @@ impl<'a> Formatter<'a> {
                 false
             },
             (keyword, _) if keyword.is_keyword() => true,
+            (infix_operator, Tag::LParen)
+                if parse::EXPRESSION_INFIX_OPS.contains(infix_operator) =>
+            {
+                true
+            },
             _ => false,
         };
 
@@ -581,7 +586,7 @@ mod tests {
                     + 4
                     + 8 / some_call_to_a_multiline_function(1, 2, 3,)
                     + 15 * -4
-                    - 14;
+                    - 14 >> (1 + 2);
             "#},
             expect![[r#"
                 // this file contains a bunch of various syntax constructs
@@ -665,7 +670,7 @@ mod tests {
                         3,
                     )
                     + 15 * -4
-                    - 14;
+                    - 14 >> (1 + 2);
             "#]],
         )
     }
