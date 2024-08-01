@@ -17,6 +17,9 @@ pub enum Tag {
     /// A comment.
     Comment,
 
+    /// A preprocessor directive
+    Preprocessor,
+
     Identifier,
 
     IntegerDecimal,
@@ -270,6 +273,7 @@ impl Tag {
             Tag::Eof => "the end of file",
             Tag::InvalidToken => "an invalid token",
             Tag::Comment => "a comment",
+            Tag::Preprocessor => "a preprocessor directive",
             Tag::Identifier => "an identifier",
             Tag::IntegerDecimal => "an integer literal",
             Tag::IntegerHex => "an integer literal",
@@ -677,7 +681,7 @@ impl<'src> Parser<'src> {
         self.current_token = loop {
             let token = self.tokens.next();
             match token.tag {
-                Tag::Comment => self.output.tree.extra.push(token),
+                Tag::Comment | Tag::Preprocessor => self.output.tree.extra.push(token),
                 _ => break token,
             }
         };

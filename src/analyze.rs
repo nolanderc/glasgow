@@ -500,6 +500,7 @@ impl<'a> DocumentContext<'a> {
         CaptureSymbols { references }
     }
 
+    // TODO: cache the result of resolving references
     fn resolve_references(&mut self, index: parse::NodeIndex) {
         if Some(index) == self.capture_node {
             self.capture = self.capture_symbols();
@@ -532,7 +533,7 @@ impl<'a> DocumentContext<'a> {
                     if let Some((actual_name, info)) =
                         self.builtin_tokens.attributes.get_key_value(text)
                     {
-                        let reference = Reference::Attribute(&actual_name, info);
+                        let reference = Reference::Attribute(actual_name, info);
                         self.references.insert(name.index(), reference);
                     }
 
@@ -1076,7 +1077,7 @@ impl<'a> DocumentContext<'a> {
                                         )),
                                     );
                                     let typ = self
-                                        .type_from_specifier(spec, self.tree, self.source)
+                                        .type_from_specifier(spec, tree, document.content())
                                         .map(Type::unwrap_inner);
                                     self.set_inferred_type(member.index(), typ.clone());
                                     return typ;

@@ -163,6 +163,15 @@ impl<'src> Tokenizer<'src> {
                 _ => (Tag::Chevron, 1),
             },
 
+            // a preprocessor directive starts with a single `#` and then ends with a newline
+            b'#' => {
+                let mut i = 1;
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                (Tag::Preprocessor, i)
+            },
+
             byte => {
                 // catch more complex identifiers down here
                 let len = identifier(source);

@@ -517,6 +517,8 @@ mod tests {
             indoc! {r#"
                 // this file contains a bunch of various syntax constructs
 
+                #include "my_file.wgsl"
+
                 @fragment
                 fn fs1() -> @location(0) vec4<f32> {
                     return vec4(1.0, 0.0, 0.0, 1.0);
@@ -541,6 +543,10 @@ mod tests {
                          * split across multiple
                          * lines, but the stars should
                          * still be aligned :-) */
+
+                    #ifdef FOO
+                    let this_line_is_disabled = 123;
+                    #endif
 
                     let y = vec2<f32>(123, 456);
 
@@ -591,6 +597,8 @@ mod tests {
             expect![[r#"
                 // this file contains a bunch of various syntax constructs
 
+                #include "my_file.wgsl"
+
                 @fragment
                 fn fs1() -> @location(0) vec4<f32> {
                     return vec4(1.0, 0.0, 0.0, 1.0);
@@ -618,6 +626,10 @@ mod tests {
                      * split across multiple
                      * lines, but the stars should
                      * still be aligned :-) */
+
+                    #ifdef FOO
+                    let this_line_is_disabled = 123;
+                    #endif
 
                     let y = vec2<f32>(123, 456);
 
