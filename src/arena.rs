@@ -1,11 +1,13 @@
-use std::{
-    marker::PhantomData,
-    num::{NonZeroU32, Wrapping},
-};
+use std::{marker::PhantomData, num::NonZeroU32};
 
 pub struct Arena<T> {
     slots: Vec<Slot<T>>,
     free: Option<Handle<T>>,
+}
+
+enum Slot<T> {
+    Free { next: Option<Handle<T>> },
+    Occupied { value: T, generation: Generation },
 }
 
 pub struct Handle<T> {
@@ -17,7 +19,7 @@ pub struct Handle<T> {
 impl<T> Copy for Handle<T> {}
 impl<T> Clone for Handle<T> {
     fn clone(&self) -> Self {
-        Self { ..*self }
+        *self
     }
 }
 
@@ -37,21 +39,23 @@ impl<T> std::hash::Hash for Handle<T> {
 
 impl<T> std::fmt::Debug for Handle<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}@{}", self.index(), self.generation)
+        #[cfg(debug_assertions)]
+        write!(f, "{}@{}", self.index(), self.generation)?;
+        #[cfg(not(debug_assertions))]
+        write!(f, "{}", self.index())?;
+        Ok(())
     }
 }
 
-type Generation = Wrapping<u32>;
+#[cfg(debug_assertions)]
+type Generation = std::num::Wrapping<u32>;
+#[cfg(not(debug_assertions))]
+type Generation = ();
 
 impl<T> Handle<T> {
     fn index(&self) -> usize {
         (self.index.get() - 1) as usize
     }
-}
-
-enum Slot<T> {
-    Free { next: Option<Handle<T>> },
-    Occupied { value: T, generation: Generation },
 }
 
 impl<T> Arena<T> {
@@ -65,8 +69,12 @@ impl<T> Arena<T> {
     }
 
     pub fn insert_with_handle(&mut self, constructor: impl FnOnce(Handle<T>) -> T) -> Handle<T> {
+        #[allow(unused_mut)]
         if let Some(mut free) = self.free {
-            free.generation += 1;
+            #[cfg(debug_assertions)]
+            {
+                free.generation += 1;
+            }
 
             let value = constructor(free);
 
@@ -83,12 +91,12 @@ impl<T> Arena<T> {
 
         let handle = Handle {
             index: NonZeroU32::new((self.slots.len() + 1) as u32).unwrap(),
-            generation: Wrapping(0),
+            generation: Default::default(),
             _phantom: PhantomData,
         };
 
         let value = constructor(handle);
-        self.slots.push(Slot::Occupied { value, generation: Wrapping(0) });
+        self.slots.push(Slot::Occupied { value, generation: Default::default() });
 
         handle
     }
