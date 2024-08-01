@@ -370,11 +370,10 @@ impl<'a> Formatter<'a> {
                 false
             },
             (keyword, _) if keyword.is_keyword() => true,
-            (infix_operator, Tag::LParen)
-                if parse::EXPRESSION_INFIX_OPS.contains(infix_operator) =>
-            {
-                true
-            },
+            (infix_operator, Tag::LParen) => const {
+                parse::EXPRESSION_INFIX_OPS.union(parse::ASSIGNMENT_OPS).union(Tag::KEYWORDS)
+            }
+            .contains(infix_operator),
             _ => false,
         };
 
@@ -549,6 +548,7 @@ mod tests {
                     #endif
 
                     let y = vec2<f32>(123, 456);
+                    let z = (1 + 2) * 3;
 
                     // single-line blocks should be allowed
                     if (1 + 1 == 2) { return vec4(); } else { return vec4(1.0); }
@@ -632,6 +632,7 @@ mod tests {
                     #endif
 
                     let y = vec2<f32>(123, 456);
+                    let z = (1 + 2) * 3;
 
                     // single-line blocks should be allowed
                     if (1 + 1 == 2) { return vec4(); } else { return vec4(1.0); }
