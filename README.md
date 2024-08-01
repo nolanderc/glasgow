@@ -46,20 +46,10 @@ Install the `glasgow` extension from the
 
 First, install [nvim-lspconfig](https://github.com/neovim/nvim-lspconfig).
 
-As `glasgow` has not yet been included in the default configs, it has to be
-added it manually:
+Then it is as simple as enabling the `glasgow` configuration:
 
 ```lua
 local lspconfig = require 'lspconfig'
-require('lspconfig.configs').glasgow = {
-    default_config = {
-        cmd = {'glasgow'},
-        filetypes = {'wgsl'},
-        root_dir = lspconfig.util.find_git_ancestor,
-        single_file_support = true,
-        settings = {},
-    }
-}
-lspconfig.glasgow.setup { capabilities = capabilities, on_attach = on_attach }
+lspconfig.glasgow.setup {}
 ```
 
