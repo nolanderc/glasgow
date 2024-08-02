@@ -554,6 +554,12 @@ impl Tree {
         path.reverse();
         path
     }
+
+    pub(crate) fn iter_extra(
+        &self,
+    ) -> impl ExactSizeIterator<Item = Node> + DoubleEndedIterator + '_ {
+        self.extra.iter().copied()
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

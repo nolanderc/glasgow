@@ -1,6 +1,6 @@
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     num::NonZeroU32,
     rc::Rc,
 };
@@ -46,26 +46,53 @@ pub struct ErrorDuplicate {
 }
 
 pub fn collect_global_scope(
-    document: DocumentId,
-    tree: &parse::Tree,
-    source: &str,
+    workspace: &Workspace,
+    source: DocumentId,
 ) -> (GlobalScope, BTreeMap<String, ErrorDuplicate>) {
-    let root = syntax::root(tree);
-
-    let mut scope = GlobalScope::with_capacity(root.parse_node().children().len());
+    let mut scope = GlobalScope::new();
     let mut errors = BTreeMap::new();
 
-    for decl in root.decls(tree) {
-        let node = ReferenceNode::from_decl(document, decl);
-        if let Some(name) = node.name_in_tree(tree) {
-            let text = &source[name.byte_range()];
-            let global = GlobalDeclaration { node };
-            if let Some(previous) = scope.insert(text.into(), global) {
-                errors
-                    .entry(text.into())
-                    .or_insert_with(|| ErrorDuplicate { conflicts: vec![previous] })
-                    .conflicts
-                    .push(global);
+    let mut reverse_order = Vec::with_capacity(16);
+    let mut visited = HashSet::new();
+
+    reverse_order.push(source);
+    visited.insert(source);
+
+    let mut i = 0;
+    while i < reverse_order.len() {
+        let current = reverse_order[i];
+        i += 1;
+
+        let document = workspace.document_from_id(current);
+        let tree = &document.parse().tree;
+        let source = document.content();
+
+        for node in tree.iter_extra() {
+            if node.tag() != parse::Tag::Preprocessor {
+                continue;
+            }
+
+            let source = &source[node.byte_range()];
+            todo!("parse include directive: {source:?}");
+        }
+    }
+
+    for id in reverse_order.into_iter().rev() {
+        let document = workspace.document_from_id(id);
+        let tree = &document.parse().tree;
+        let root = syntax::root(tree);
+        for decl in root.decls(tree) {
+            let node = ReferenceNode::from_decl(source, decl);
+            if let Some(name) = node.name_in_tree(tree) {
+                let text = &document.content()[name.byte_range()];
+                let global = GlobalDeclaration { node };
+                if let Some(previous) = scope.insert(text.into(), global) {
+                    errors
+                        .entry(text.into())
+                        .or_insert_with(|| ErrorDuplicate { conflicts: vec![previous] })
+                        .conflicts
+                        .push(global);
+                }
             }
         }
     }
@@ -278,11 +305,11 @@ impl<'a> DocumentContext<'a> {
             workspace,
 
             document,
-            global_scope: &document.global_scope().symbols,
+            global_scope: &document.global_scope(workspace).symbols,
             tree: &document.parse().tree,
             source: document.content(),
             scope: Scope::new(),
-            errors: Vec::new().into(),
+            errors: Vec::new(),
 
             within_attribute_builtin: false,
 

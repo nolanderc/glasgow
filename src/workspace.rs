@@ -228,11 +228,9 @@ impl Document {
         })
     }
 
-    pub fn global_scope(&self) -> &GlobalScopeOutput {
+    pub fn global_scope(&self, workspace: &Workspace) -> &GlobalScopeOutput {
         self.global_scope.get_or_init(|| {
-            let parsed = self.parse();
-            let (symbols, errors) =
-                crate::analyze::collect_global_scope(self.id, &parsed.tree, self.content());
+            let (symbols, errors) = crate::analyze::collect_global_scope(workspace, self.id);
             GlobalScopeOutput { symbols, errors }
         })
     }

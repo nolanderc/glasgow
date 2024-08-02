@@ -360,7 +360,7 @@ fn collect_diagnostics(state: &State, uri: &lsp::Uri) -> Result<Vec<lsp::Diagnos
         });
     }
 
-    let global_scope = document.global_scope();
+    let global_scope = document.global_scope(&state.workspace);
     for (name, duplicate) in global_scope.errors.iter() {
         for conflict in duplicate.conflicts.iter() {
             let Some(ident) = conflict.name_in_tree(&parsed.tree) else { continue };

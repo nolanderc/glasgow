@@ -70,6 +70,7 @@ impl<'a> Formatter<'a> {
         let node = self.tree.node(index);
 
         let indent_before = self.state.indent;
+        let indent_base_before = self.state.indent_base;
 
         match node.tag() {
             Tag::Root => {
@@ -175,6 +176,27 @@ impl<'a> Formatter<'a> {
                 }
             },
 
+            Tag::ExprParens => {
+                let mut multiline = false;
+                self.state.indent_base = self.state.indent;
+                for child in node.children() {
+                    let tag = self.tree.node(child).tag();
+                    if multiline && tag == Tag::RParen {
+                        self.indent_decrease();
+                        self.emit_newlines(1, 1);
+                    }
+
+                    self.emit_node(child);
+
+                    if tag == Tag::LParen {
+                        multiline = self.emit_newlines(0, 1) != 0;
+                        if multiline {
+                            self.indent_increase();
+                        }
+                    }
+                }
+            },
+
             tag if tag.is_token() => self.emit_token(node),
             _ => {
                 for child in node.children() {
@@ -188,6 +210,7 @@ impl<'a> Formatter<'a> {
         }
 
         self.state.indent = indent_before;
+        self.state.indent_base = indent_base_before;
     }
 
     fn emit_list_comma_separated(&mut self, node: parse::Node, open_tag: Tag, close_tag: Tag) {
@@ -246,7 +269,10 @@ impl<'a> Formatter<'a> {
                     let len_before = self.output.len();
                     let line_before = self.state.line;
 
+                    let base_old =
+                        std::mem::replace(&mut self.state.indent_base, self.state.indent);
                     self.emit_node(child);
+                    self.state.indent_base = base_old;
 
                     let len_after = self.output.len();
                     let line_after = self.state.line;
@@ -760,6 +786,34 @@ mod tests {
                         90,
                     );
                 }
+            "#]],
+        )
+    }
+
+    #[test]
+    fn multiline_expression() {
+        check_formatting(
+            indoc! {r#"
+                const foo = 1 + 2 * (
+                    1 + 2
+                    * 3 + foo(
+                        1 + (
+                            2
+                            + 3
+                        ),
+                    )
+                );
+            "#},
+            expect![[r#"
+                const foo = 1 + 2 * (
+                    1 + 2
+                    * 3 + foo(
+                        1 + (
+                            2
+                            + 3
+                        ),
+                    )
+                );
             "#]],
         )
     }
