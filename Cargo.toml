@@ -12,7 +12,7 @@ clap = { version = "4.5.9", features = ["derive"] }
 lsp-server = "0.7.6"
 lsp = { package = "lsp-types", version = "0.97.0" }
 serde_json = "1.0.120"
-wgsl-spec = { version = "0.2.0", path = "../wgsl-spec", features = ["include"] }
+wgsl-spec = { version = "0.2.0", features = ["include"] }
 serde = "1.0.204"
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
