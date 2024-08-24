@@ -595,6 +595,8 @@ checksum = "830b7e5d4d90034032940e4ace0d9a9a057e7a45cd94e6c007832e39edb82f6d"
 [[package]]
 name = "wgsl-spec"
 version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b67cf01d39a6404b7d29e4ca583748624c862e30be47a6b00ddd239d80132e45"
 dependencies = [
  "serde",
  "serde_json",

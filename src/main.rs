@@ -157,6 +157,27 @@ fn add_routes(router: &mut Router) {
             .offset_utf8_from_position_utf16(location.position)
             .context("invalid position")?;
 
+        {
+            // check if we are inside a comment, and if so, don't provide any completions
+            let tree = &document.parse().tree;
+            let extras = tree.extras();
+            let extra = extras.binary_search_by(|node| {
+                let range = node.byte_range();
+                if offset < range.start {
+                    std::cmp::Ordering::Less
+                } else if offset >= range.end {
+                    std::cmp::Ordering::Greater
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            });
+            if let Ok(index) = extra {
+                if extras[index].tag() == parse::Tag::Comment {
+                    return Ok(None);
+                }
+            }
+        }
+
         let Some((symbols, _token)) =
             document.visible_symbols_in_range(&state.workspace, 0..offset)
         else {

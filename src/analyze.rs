@@ -282,7 +282,7 @@ impl<'a> DocumentContext<'a> {
             tree: &document.parse().tree,
             source: document.content(),
             scope: Scope::new(),
-            errors: Vec::new().into(),
+            errors: Vec::new(),
 
             within_attribute_builtin: false,
 

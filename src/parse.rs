@@ -427,6 +427,10 @@ impl Tree {
         self.extra.get(index).copied()
     }
 
+    pub(crate) fn extras(&self) -> &[Node] {
+        &self.extra
+    }
+
     pub fn root_index(&self) -> NodeIndex {
         NodeIndex((self.nodes.len() - 1) as u32)
     }
