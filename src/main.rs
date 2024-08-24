@@ -352,7 +352,12 @@ fn collect_diagnostics(state: &State, uri: &lsp::Uri) -> Result<Vec<lsp::Diagnos
     let parsed = document.parse();
     for error in parsed.errors.clone().iter() {
         diagnostics.push(lsp::Diagnostic {
-            range: document.range_utf16_from_range_utf8(error.token.byte_range()).unwrap(),
+            range: {
+                let previous_end = error.token_previous.byte_range().end;
+                let start = document.position_utf16_from_offset_utf8(previous_end).unwrap();
+                let end = lsp::Position { line: start.line, character: start.character + 1 };
+                lsp::Range { start, end }
+            },
             severity: Some(lsp::DiagnosticSeverity::ERROR),
             source: Some("syntax".into()),
             message: error.message(document.content()),

@@ -558,26 +558,17 @@ impl Tree {
 
 #[derive(Debug, Clone, Copy)]
 pub struct Error {
-    pub token: Node,
+    pub token_found: Node,
+    pub token_previous: Node,
     pub expected: Expected,
 }
 
 impl Error {
     pub fn message(self, source: &str) -> String {
-        let expected = match self.expected {
-            Expected::Token(token) => match token.token_description() {
-                Some(description) => format!("expected {description}"),
-                _ => unreachable!("expected a token, but found {token:?}"),
-            },
-            Expected::Declaration => "expected a declaration".into(),
-            Expected::Expression => "expected an expression".into(),
-            Expected::Statement => "expected a statement".into(),
-        };
-
-        let found = match self.token.tag {
+        let found = match self.token_found.tag {
             Tag::Eof => "the end of file".to_string(),
             _ => {
-                let snippet = &source[self.token.byte_range()];
+                let snippet = &source[self.token_found.byte_range()];
                 let print_safe = snippet.bytes().all(|x| x.is_ascii_graphic() || x == b' ');
                 if print_safe {
                     format!("`{snippet}`")
@@ -587,7 +578,7 @@ impl Error {
             },
         };
 
-        format!("{expected}, but found {found}")
+        format!("{}, but found {found}", self.expected.message())
     }
 }
 
@@ -599,9 +590,24 @@ pub enum Expected {
     Statement,
 }
 
+impl Expected {
+    pub fn message(self) -> String {
+        match self {
+            Expected::Token(token) => match token.token_description() {
+                Some(description) => format!("expected {description}"),
+                _ => unreachable!("expected a token, but found {token:?}"),
+            },
+            Expected::Declaration => "expected a declaration".into(),
+            Expected::Expression => "expected an expression".into(),
+            Expected::Statement => "expected a statement".into(),
+        }
+    }
+}
+
 pub struct Parser<'src> {
     tokens: token::Tokenizer<'src>,
     current_token: Node,
+    previous_token: Node,
 
     stack: Vec<Node>,
     output: Output,
@@ -622,6 +628,7 @@ impl<'src> Parser<'src> {
         Parser {
             tokens: token::Tokenizer::empty(),
             current_token: Node { tag: Tag::Eof, length: U24::ZERO, offset: 0 },
+            previous_token: Node { tag: Tag::Eof, length: U24::ZERO, offset: 0 },
             stack: Vec::new(),
             output: Output::default(),
             fuel: 0,
@@ -673,11 +680,16 @@ impl<'src> Parser<'src> {
     }
 
     fn emit_error(&mut self, expected: Expected) {
-        self.output.errors.push(Error { token: self.current_token, expected })
+        self.output.errors.push(Error {
+            token_found: self.current_token,
+            token_previous: self.previous_token,
+            expected,
+        })
     }
 
     fn advance_no_emit(&mut self) {
         self.fuel = Self::MAX_FUEL;
+        self.previous_token = self.current_token;
         self.current_token = loop {
             let token = self.tokens.next();
             match token.tag {
@@ -1485,7 +1497,7 @@ mod tests {
         if !output.errors.is_empty() {
             writeln!(text, "===== ERRORS =====").unwrap();
             for error in output.errors.iter() {
-                let before = &source[..error.token.offset as usize];
+                let before = &source[..error.token_found.offset as usize];
                 let line = before.lines().count();
                 let line_start = before.rfind('\n').map(|x| x + 1).unwrap_or(0);
                 let column = before[line_start..].chars().count();
